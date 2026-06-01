@@ -2611,14 +2611,20 @@ def _verify_manifest_against_mirror(
         src_path = os.path.join(source_days, basename)
         try:
             src_st = os.stat(src_path)
-        except OSError:
+        except OSError as exc:
             if actual_size != expected_size:
                 return (
                     f"chunk {basename} size mismatch: manifest={expected_size}"
                     f" mirror={actual_size} (source unstatable)"
                 )
-            # Mirror agrees with manifest, source unreadable -- publish.
-            continue
+            # Mirror agrees with manifest in size, but without a source stat
+            # we cannot run the same-size-mtime-drift check below -- a
+            # same-size rewrite race would publish silently. Defer publication
+            # until the next tick when the source is statable again.
+            return (
+                f"chunk {basename} source unstatable: {exc}"
+                f" (defer; cannot verify same-size mtime parity)"
+            )
         if actual_size == expected_size:
             if src_st.st_mtime_ns != local_st.st_mtime_ns:
                 # Same-size rewrite race: source was rewritten after phase 1
@@ -2924,11 +2930,37 @@ def _do_mirror(source_dir: str, dest_root: str, log_enabled: bool) -> int:
                         except OSError:
                             pass
 
+    # PHASE 3 -- prune day chunks in the mirror whose basename is no longer
+    # present at the source. Only runs after a successful manifest publish so
+    # we never delete a chunk that the still-current mirror manifest may
+    # reference. `entries` is the source listdir snapshot from phase 1; build
+    # the keep-set from its .json basenames and unlink anything else.
+    chunks_pruned = 0
+    if copied_manifest:
+        source_basenames = {n for n in entries if n.endswith(".json")}
+        try:
+            dst_entries = os.listdir(dest_days)
+        except OSError as exc:
+            dst_entries = []
+            if log_enabled:
+                _mirror_log(dest_root, f"prune listdir failed: {exc}")
+        for name in dst_entries:
+            if not name.endswith(".json"):
+                continue
+            if name in source_basenames:
+                continue
+            try:
+                os.unlink(os.path.join(dest_days, name))
+                chunks_pruned += 1
+            except OSError as exc:
+                if log_enabled:
+                    _mirror_log(dest_root, f"prune {name} failed: {exc}")
+
     if log_enabled:
         _mirror_log(
             dest_root,
             f"tick manifest={int(copied_manifest)} copied={chunks_copied} "
-            f"skipped={chunks_skipped} errors={errors}",
+            f"skipped={chunks_skipped} pruned={chunks_pruned} errors={errors}",
         )
     return 0 if errors == 0 else 5
 
@@ -3068,15 +3100,45 @@ def _install_mirror_agent(mirror_root: str, source_dir: str, interval: int) -> i
     print("   Without this the launchd-spawned mirror cannot fault iCloud-")
     print("   evicted day chunks (logs `Resource deadlock avoided`).")
     print()
-    print("2. Load the agent and trigger the first tick:")
-    print()
     # bootout first so a reinstall picks up the new ProgramArguments
     # (--interval / --source / --mirror-root). bootstrap is a no-op if
     # the label is already loaded, which means launchd would otherwise
     # keep the previous in-memory plist and silently ignore the edit.
-    # On a first install bootout exits non-zero with "No such process";
-    # that is expected, hence the `|| true`.
-    print(f"     launchctl bootout gui/{uid}/{MIRROR_LABEL} || true   # ignore 'No such process' on a first install")
+    # Run it ourselves (not as a printed `|| true` line) so real launchd
+    # errors -- permission denied, bad domain, etc. -- surface instead of
+    # being masked by the shell's true. On a first install the agent is
+    # not loaded; that returns a benign "no such process" / "could not
+    # find service" / "not loaded" which we treat as success.
+    try:
+        boot = subprocess.run(
+            ["launchctl", "bootout", f"gui/{uid}/{MIRROR_LABEL}"],
+            capture_output=True, text=True,
+        )
+    except FileNotFoundError:
+        # launchctl missing (non-macOS / pruned PATH). Skip the pre-clear;
+        # the user's bootstrap step below will fail loudly if it matters.
+        pass
+    else:
+        if boot.returncode != 0:
+            msg = (boot.stderr or boot.stdout or "").strip() or "not loaded"
+            benign_markers = ("no such process", "could not find service", "not loaded")
+            if not any(m in msg.lower() for m in benign_markers):
+                # Real launchd failure: the prior agent is still resident.
+                # bootstrap below will fail with "service already loaded";
+                # surface the underlying error now so the user knows what
+                # to fix rather than chasing a misleading bootstrap error.
+                print(
+                    f"launchctl bootout FAILED: {msg}",
+                    file=sys.stderr,
+                )
+                print(
+                    "  the previous agent is still loaded in memory; fix the"
+                    " launchd error above and re-run setup-mirror.",
+                    file=sys.stderr,
+                )
+                return 1
+    print("2. Load the agent and trigger the first tick:")
+    print()
     print(f"     launchctl bootstrap gui/{uid} {plist_path}")
     print(f"     launchctl kickstart -k gui/{uid}/{MIRROR_LABEL}")
     print()
