@@ -1829,13 +1829,14 @@ def load_export_or_report(path: str, as_json: bool) -> tuple[Optional[dict], int
             print("HealthDrop export exists but this process cannot read it:")
             print(f"  {path}")
             if "Mobile Documents" in path:
+                examine_abs = os.path.abspath(__file__)
                 print()
                 print("This is a macOS TCC restriction: iCloud app-private containers")
                 print("are not readable from processes outside a Terminal with Full")
                 print("Disk Access. Two fixes:")
                 print()
                 print("  A. One-time mirror (recommended -- bypasses TCC for any consumer):")
-                print("       python3 examine.py setup-mirror")
+                print(f"       python3 {examine_abs} setup-mirror")
                 print("     then follow the printed launchctl + Full Disk Access steps.")
                 print("     The skill will auto-prefer the mirror on subsequent runs.")
                 print()
@@ -2468,7 +2469,13 @@ def _mirror_log(dest_root: str, message: str) -> None:
 
 
 def _needs_copy(src: str, dst: str) -> bool:
-    """True iff dst is missing or differs from src in size or mtime."""
+    """True iff dst is missing or differs from src in size or mtime.
+
+    Compares st_mtime_ns (nanosecond precision) rather than seconds-rounded
+    st_mtime: iCloud and HealthDrop both atomically rewrite files, and a
+    sub-second rewrite that preserves size would otherwise be silently
+    skipped, leaving the mirror permanently stale for that file.
+    """
     if not os.path.exists(dst):
         return True
     try:
@@ -2476,7 +2483,7 @@ def _needs_copy(src: str, dst: str) -> bool:
         s_dst = os.stat(dst)
     except OSError:
         return True
-    return s_src.st_size != s_dst.st_size or int(s_src.st_mtime) != int(s_dst.st_mtime)
+    return s_src.st_size != s_dst.st_size or s_src.st_mtime_ns != s_dst.st_mtime_ns
 
 
 def _atomic_copy(src: str, dst: str) -> None:
@@ -2507,7 +2514,10 @@ def _atomic_copy(src: str, dst: str) -> None:
                     break
                 fh_dst.write(buf)
             s = os.fstat(fh_src.fileno())  # the file we actually read, not the path
-        os.utime(tmp, (s.st_atime, s.st_mtime))
+        # ns= form so the stamped mtime matches _needs_copy's nanosecond
+        # comparison; the (float, float) form rounds to filesystem-native
+        # precision and would mismatch on later ticks.
+        os.utime(tmp, ns=(s.st_atime_ns, s.st_mtime_ns))
         os.replace(tmp, dst)
     except OSError:
         try:
@@ -2552,37 +2562,43 @@ def _do_mirror(source_dir: str, dest_root: str, log_enabled: bool) -> int:
             if log_enabled:
                 _mirror_log(dest_root, f"manifest copy failed: {exc}")
 
+    # Try listdir directly rather than gating on os.path.isdir(): a TCC denial
+    # on the stat() that backs isdir() would otherwise look identical to a
+    # missing days/ dir, silently producing a manifest-only mirror with
+    # errors=0. Distinguish FileNotFoundError (truly absent) from other OSError
+    # (permission or coordination failure -- a real problem to surface).
     src_days = os.path.join(source_dir, "days")
-    if os.path.isdir(src_days):
-        try:
-            entries = sorted(os.listdir(src_days))
-        except OSError as exc:
-            errors += 1
-            if log_enabled:
-                _mirror_log(dest_root, f"days/ listdir failed: {exc}")
-            entries = []
-        for name in entries:
-            if not name.endswith(".json"):
-                continue
-            src = os.path.join(src_days, name)
-            dst = os.path.join(dest_days, name)
-            if _needs_copy(src, dst):
-                try:
-                    _atomic_copy(src, dst)
-                    chunks_copied += 1
-                except OSError as exc:
-                    errors += 1
-                    if log_enabled:
-                        # EDEADLK (errno 11) from an iCloud-container read means
-                        # the kernel's brc/iCloud coordination refused to fault
-                        # the file in for this process -- almost always because
-                        # the launchd-spawned python lacks Full Disk Access.
-                        hint = ""
-                        if getattr(exc, "errno", None) == 11:
-                            hint = "  [iCloud refused to materialise -- grant Full Disk Access to the python binary]"
-                        _mirror_log(dest_root, f"chunk {name} copy failed: {exc}{hint}")
-            else:
-                chunks_skipped += 1
+    try:
+        entries = sorted(os.listdir(src_days))
+    except FileNotFoundError:
+        entries = []  # no days/ yet -- legitimately fine, e.g. first-export user
+    except OSError as exc:
+        errors += 1
+        if log_enabled:
+            _mirror_log(dest_root, f"days/ listdir failed: {exc}")
+        entries = []
+    for name in entries:
+        if not name.endswith(".json"):
+            continue
+        src = os.path.join(src_days, name)
+        dst = os.path.join(dest_days, name)
+        if _needs_copy(src, dst):
+            try:
+                _atomic_copy(src, dst)
+                chunks_copied += 1
+            except OSError as exc:
+                errors += 1
+                if log_enabled:
+                    # EDEADLK (errno 11) from an iCloud-container read means
+                    # the kernel's brc/iCloud coordination refused to fault
+                    # the file in for this process -- almost always because
+                    # the launchd-spawned python lacks Full Disk Access.
+                    hint = ""
+                    if getattr(exc, "errno", None) == 11:
+                        hint = "  [iCloud refused to materialise -- grant Full Disk Access to the python binary]"
+                    _mirror_log(dest_root, f"chunk {name} copy failed: {exc}{hint}")
+        else:
+            chunks_skipped += 1
 
     if log_enabled:
         _mirror_log(
@@ -2682,9 +2698,9 @@ def _install_mirror_agent(mirror_root: str, source_dir: str, interval: int) -> i
     print("3. Verify:")
     print(f"     tail -1 {mirror_root}/mirror-log.txt   # expect errors=0")
     print(f"     ls {mirror_root}/days | wc -l           # matches the source count")
-    print( "     python3 examine.py query list           # mirror is auto-preferred")
+    print(f"     python3 {examine_path} query list   # mirror is auto-preferred")
     print()
-    print("To remove later:  python3 examine.py setup-mirror --uninstall")
+    print(f"To remove later:  python3 {examine_path} setup-mirror --uninstall")
     return 0
 
 
