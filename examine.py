@@ -2494,6 +2494,63 @@ def _ensure_private_mirror_dirs(mirror_root: str) -> None:
             pass  # best-effort; permission tightening is hygiene, not load-bearing
 
 
+def _verify_manifest_against_mirror(src_manifest: str, dest_days: str) -> Optional[str]:
+    """Cheap pre-publication check: does the source manifest's days list
+    match files already in the mirror's days/ dir?
+
+    Returns None if everything lines up, or a short reason string describing
+    the first mismatch. Catches the TOCTOU window between phase 1 (chunk
+    copy) and phase 2 (manifest publish): if iCloud delivered a fresh
+    manifest mid-tick that references chunks we did not copy (or copied a
+    previous version of), publishing it would let _expand_manifest_chunks()
+    silently skip the missing/short ones and lie to readers.
+
+    Compares `sizeBytes` -- per-chunk byte counts the producer recorded --
+    against the mirror's local file sizes. sha256 verification would be
+    stronger but costs a full file read per chunk per tick. Size catches
+    the most common drift (new chunk arrived, growing chunk hasn't fully
+    re-synced) without that cost; if a same-size rewrite slips through,
+    the next tick's mtime-driven copy still catches it.
+    """
+    try:
+        with open(src_manifest, "rb") as fh:
+            manifest = json.loads(fh.read())
+    except (OSError, json.JSONDecodeError) as exc:
+        # If we can't parse the source manifest, don't publish it -- the
+        # downstream parse_error gate will surface the JSON problem
+        # separately on the next reader run.
+        return f"source manifest unreadable: {exc}"
+    days = manifest.get("days") if isinstance(manifest, dict) else None
+    if not isinstance(days, list):
+        return None  # legacy v2-shaped or unstructured -- nothing to verify
+    for entry in days:
+        if not isinstance(entry, dict):
+            continue
+        rel = entry.get("path")
+        if not isinstance(rel, str) or not rel:
+            continue
+        expected_size = entry.get("sizeBytes")
+        if not isinstance(expected_size, int):
+            continue  # producer omitted the hint; skip
+        # `rel` is "days/YYYY-MM-DD.json" relative to the manifest's parent;
+        # the mirror keeps the same layout, so look up by basename under
+        # dest_days.
+        basename = os.path.basename(rel)
+        local = os.path.join(dest_days, basename)
+        try:
+            actual_size = os.stat(local).st_size
+        except FileNotFoundError:
+            return f"manifest references {basename} which is not mirrored"
+        except OSError as exc:
+            return f"mirror chunk {basename} unstatable: {exc}"
+        if actual_size != expected_size:
+            return (
+                f"chunk {basename} size mismatch: manifest={expected_size}"
+                f" mirror={actual_size}"
+            )
+    return None
+
+
 def _mirror_log(dest_root: str, message: str) -> None:
     """Append a timestamped line to the mirror's own log. Best-effort.
 
@@ -2665,27 +2722,42 @@ def _do_mirror(source_dir: str, dest_root: str, log_enabled: bool) -> int:
             chunks_skipped += 1
 
     # PHASE 2 -- publish the manifest only if every chunk we touched
-    # succeeded. If anything failed (TCC, EIO, ...), keep the previous
-    # manifest in place so readers continue to see a self-consistent
-    # snapshot until the next tick resolves the failures. A reader that
-    # follows the OLD manifest may miss the latest day's data, but the
-    # rest of the snapshot remains coherent -- strictly better than
-    # serving a NEW manifest that points at days we did not copy.
+    # succeeded AND the manifest's per-day promises match what we have on
+    # disk. If anything failed (TCC, EIO, ...) or a TOCTOU race made the
+    # source manifest reference chunks we didn't copy / copied a stale
+    # version of, keep the previous manifest in place so readers continue
+    # to see a self-consistent snapshot until the next tick resolves it.
+    # A reader following the OLD manifest may miss the latest day's data,
+    # but the rest of the snapshot stays coherent -- strictly better than
+    # serving a NEW manifest that promises chunks we don't have.
     if _needs_copy(src_manifest, dst_manifest):
-        if errors == 0:
-            try:
-                _atomic_copy(src_manifest, dst_manifest)
-                copied_manifest = True
-            except OSError as exc:
-                errors += 1
-                if log_enabled:
-                    _mirror_log(dest_root, f"manifest copy failed: {exc}")
-        else:
+        if errors > 0:
             if log_enabled:
                 _mirror_log(
                     dest_root,
                     f"manifest publication deferred: {errors} chunk error(s) this tick",
                 )
+        else:
+            mismatch_reason = _verify_manifest_against_mirror(src_manifest, dest_days)
+            if mismatch_reason is not None:
+                # Manifest references chunks we didn't (yet) mirror correctly
+                # -- could be a fresh export landed mid-tick whose new chunks
+                # haven't synced from iCloud yet, or a chunk we copied was
+                # rewritten on the source between phase 1 and now.
+                errors += 1
+                if log_enabled:
+                    _mirror_log(
+                        dest_root,
+                        f"manifest publication deferred: {mismatch_reason}",
+                    )
+            else:
+                try:
+                    _atomic_copy(src_manifest, dst_manifest)
+                    copied_manifest = True
+                except OSError as exc:
+                    errors += 1
+                    if log_enabled:
+                        _mirror_log(dest_root, f"manifest copy failed: {exc}")
 
     if log_enabled:
         _mirror_log(
@@ -2953,14 +3025,34 @@ def _build_shell_snippet(python_path: str, examine_path: str,
     )
 
 
+class _MalformedHookBlock(Exception):
+    """Raised when a sentinel BEGIN appears without a matching END (or vice
+    versa) in the rc file. Refuse to "strip" in that case -- naïvely walking
+    to EOF would delete every user line written below the BEGIN marker."""
+
+
 def _strip_hook_block(content: str) -> str:
     """Remove the sentinel-delimited block from content, if present.
 
     Leaves the rest of the file byte-identical when no block matches, so a
     no-op uninstall doesn't rewrite the rc and disturb its mtime / signing
-    state. Idempotent.
+    state. Idempotent for well-formed blocks.
+
+    Raises _MalformedHookBlock if the rc has a BEGIN without END or an END
+    without BEGIN -- a previous manual edit, partial copy, or interrupted
+    write can leave the rc in that state, and silently stripping to EOF
+    would delete every user line written below the BEGIN marker. Callers
+    handle this as a non-fatal "refusing to touch" so the user can fix
+    by hand.
     """
-    if SHELL_HOOK_BEGIN not in content:
+    has_begin = SHELL_HOOK_BEGIN in content
+    has_end = SHELL_HOOK_END in content
+    if has_begin != has_end:
+        raise _MalformedHookBlock(
+            "BEGIN sentinel without matching END" if has_begin
+            else "END sentinel without matching BEGIN"
+        )
+    if not has_begin:
         return content
     out: list[str] = []
     skip = False
@@ -3010,7 +3102,16 @@ def _install_shell_hook(rc_path: str, mirror_root: str, source_dir: str) -> int:
         print(f"could not read {rc_path}: {exc}")
         return 1
 
-    cleaned = _strip_hook_block(existing)
+    try:
+        cleaned = _strip_hook_block(existing)
+    except _MalformedHookBlock as exc:
+        # A user-edited rc with mismatched sentinels means we cannot safely
+        # replace the block without potentially deleting their other content.
+        # Refuse loudly rather than guess.
+        print(f"refusing to install: rc has malformed hook markers ({exc})")
+        print(f"  fix by hand:  {rc_path}")
+        print( "  then re-run setup-mirror --shell.")
+        return 1
     if cleaned and not cleaned.endswith("\n"):
         cleaned += "\n"
     new_content = cleaned + _build_shell_snippet(
@@ -3095,17 +3196,26 @@ def _install_shell_hook(rc_path: str, mirror_root: str, source_dir: str) -> int:
 
 
 def _uninstall_shell_hook(rc_path: str) -> bool:
-    """Return True if a hook block was found and removed, False otherwise."""
+    """Return True if a hook block was found and removed, False if no block
+    is present in the rc.
+
+    Raises OSError if the rc has a block but cannot be read or rewritten
+    (e.g. read-only filesystem, permission denied). Raises
+    _MalformedHookBlock if the rc has only one of the BEGIN/END sentinels;
+    refusing to touch is safer than guessing where the block ends.
+
+    Both exception cases let cmd_setup_mirror --uninstall distinguish "no
+    work to do" from "the user's hook is still installed and we couldn't
+    remove it", which the old bool-only return collapsed into the same
+    "no block found" message.
+    """
     try:
         with open(rc_path, "r", encoding="utf-8") as fh:
             existing = fh.read()
     except FileNotFoundError:
         return False
-    except OSError as exc:
-        print(f"could not read {rc_path}: {exc}")
-        return False
 
-    cleaned = _strip_hook_block(existing)
+    cleaned = _strip_hook_block(existing)  # may raise _MalformedHookBlock
     if cleaned == existing:
         return False  # no block found
 
@@ -3113,15 +3223,22 @@ def _uninstall_shell_hook(rc_path: str) -> bool:
         existing_mode = os.stat(rc_path).st_mode & 0o777
     except OSError:
         existing_mode = 0o600
+    tmp = rc_path + ".tmp.healthdrop"
     try:
-        tmp = rc_path + ".tmp.healthdrop"
         with open(tmp, "w", encoding="utf-8") as fh:
             fh.write(cleaned)
         os.chmod(tmp, existing_mode)  # preserve rc perms; never demote 0o600 to 0o644
         os.replace(tmp, rc_path)
-    except OSError as exc:
-        print(f"could not write {rc_path}: {exc}")
-        return False
+    except OSError:
+        # Re-raise so cmd_setup_mirror --uninstall can distinguish a real
+        # write failure from "no block found" and return non-zero. Returning
+        # False here would let the command exit 0 with "no shell hook block
+        # found" while the hook is actually still installed.
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
     return True
 
 
@@ -3169,14 +3286,28 @@ def cmd_setup_mirror(argv: list[str]) -> int:
         # mirror ticks forever.
         rcs = [rc_path] if args.shell_rc else _candidate_shell_rcs()
         removed_any = False
+        errors_any = False
         for rc in rcs:
-            if _uninstall_shell_hook(rc):
-                print(f"removed shell hook block from {rc}")
-                removed_any = True
-        if not removed_any:
+            try:
+                if _uninstall_shell_hook(rc):
+                    print(f"removed shell hook block from {rc}")
+                    removed_any = True
+            except _MalformedHookBlock as exc:
+                # Hook markers present but malformed -- refuse to touch and
+                # surface non-zero so the user knows the hook is still live.
+                print(f"malformed hook markers in {rc} ({exc}); not modifying", file=sys.stderr)
+                errors_any = True
+            except OSError as exc:
+                # rc has the hook but we couldn't rewrite it. Surface
+                # non-zero so a script following the printed "ok" does not
+                # assume removal succeeded.
+                print(f"could not rewrite {rc}: {exc}", file=sys.stderr)
+                errors_any = True
+        if not removed_any and not errors_any:
             target = rc_path if args.shell_rc else "any known rc"
             print(f"no shell hook block found in {target}")
-        return plist_code
+        # plist_code is launchd-side; or together so any failure propagates.
+        return 1 if (errors_any or plist_code != 0) else 0
 
     source = args.source or _icloud_documents_dir()
     if args.shell:
