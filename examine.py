@@ -2662,12 +2662,16 @@ def _stage_source_file(src: str, staged_tmp: str) -> None:
 
     Same shape as _atomic_copy minus the os.replace(): on OSError, the
     .tmp is unlinked and the exception re-raised. 0o600 like everything
-    else in the mirror.
+    else in the mirror -- and we fchmod() the open fd explicitly because
+    O_CREAT only sets perms when CREATING the file; an existing .tmp from
+    a previous run would retain whatever mode it had and that mode would
+    survive os.replace() onto the published path.
     """
     try:
         with open(src, "rb") as fh_src:
             tmp_fd = os.open(staged_tmp, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
             try:
+                os.fchmod(tmp_fd, 0o600)
                 fh_dst = os.fdopen(tmp_fd, "wb")
             except OSError:
                 os.close(tmp_fd)
@@ -2720,9 +2724,15 @@ def _atomic_copy(src: str, dst: str) -> None:
             # O_CREAT mode 0o600 forces a private-by-default permission on
             # the mirrored file regardless of the process umask -- the
             # data was private in iCloud's TCC container and should stay
-            # private in the mirror.
+            # private in the mirror. fchmod() after open is load-bearing:
+            # O_CREAT's mode argument is ignored when the file already
+            # exists (a stale .tmp from a previous crashed run), so
+            # without the explicit fchmod a permissive sidecar would
+            # survive truncation and that mode would ride along through
+            # os.replace() onto the published dst.
             tmp_fd = os.open(tmp, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
             try:
+                os.fchmod(tmp_fd, 0o600)
                 fh_dst = os.fdopen(tmp_fd, "wb")
             except OSError:
                 os.close(tmp_fd)
@@ -3057,6 +3067,7 @@ def _install_mirror_agent(mirror_root: str, source_dir: str, interval: int) -> i
 def _uninstall_mirror_agent() -> int:
     plist_path = _plist_path()
     uid = os.getuid()
+    bootout_failed_for_real = False
 
     try:
         boot = subprocess.run(
@@ -3071,9 +3082,28 @@ def _uninstall_mirror_agent() -> int:
         if boot.returncode == 0:
             print(f"launchctl bootout: ok ({MIRROR_LABEL})")
         else:
-            # Common case: agent wasn't loaded. Surface the message but don't fail.
+            # Distinguish the benign "agent wasn't loaded" case from a real
+            # launchd failure (permission denied, bad domain, etc.). If
+            # bootout failed for a real reason, the agent is still running
+            # in memory and removing the plist below would NOT stop it --
+            # collapsing that into a successful uninstall would falsely tell
+            # the user the mirror has stopped firing when it hasn't.
             msg = (boot.stderr or boot.stdout or "").strip() or "not loaded"
-            print(f"launchctl bootout: {msg}")
+            benign_markers = ("no such process", "could not find service", "not loaded")
+            is_benign = any(m in msg.lower() for m in benign_markers)
+            if is_benign:
+                print(f"launchctl bootout: {msg}")
+            else:
+                print(
+                    f"launchctl bootout FAILED: {msg}",
+                    file=sys.stderr,
+                )
+                print(
+                    "  the agent may still be loaded in memory and will keep firing"
+                    " ticks until reboot. fix the launchd error and re-run --uninstall.",
+                    file=sys.stderr,
+                )
+                bootout_failed_for_real = True
 
     if os.path.exists(plist_path):
         try:
@@ -3088,7 +3118,10 @@ def _uninstall_mirror_agent() -> int:
     print()
     print("The mirror directory (~/.healthdrop/) is intentionally kept so cached")
     print("data is not lost. Delete it manually if you no longer want the mirror.")
-    return 0
+    # Surface a non-zero exit code when bootout failed for a real reason
+    # (not "not loaded"). Caller / script downstream of this command needs
+    # to know the agent might still be live in memory.
+    return 1 if bootout_failed_for_real else 0
 
 
 SHELL_HOOK_BEGIN = "# >>> healthdrop mirror (auto-installed by setup-mirror --shell) >>>"
