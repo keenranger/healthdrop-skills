@@ -2549,18 +2549,31 @@ def _atomic_copy(src: str, dst: str) -> None:
     """
     tmp = dst + ".tmp"
     try:
-        # O_CREAT mode 0o600 forces a private-by-default permission on the
-        # mirrored file regardless of the process umask -- the data was
-        # private in iCloud's TCC container and should stay private in the
-        # mirror.
-        tmp_fd = os.open(tmp, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
-        with open(src, "rb") as fh_src, os.fdopen(tmp_fd, "wb") as fh_dst:
-            while True:
-                buf = fh_src.read(65536)
-                if not buf:
-                    break
-                fh_dst.write(buf)
-            s = os.fstat(fh_src.fileno())  # the file we actually read, not the path
+        # Open the source BEFORE creating the .tmp fd: if iCloud denies the
+        # source read with EDEADLK (common for evicted chunks under a
+        # launchd context without Full Disk Access), the failure happens
+        # inside open() and we never end up with a dangling tmp_fd. The
+        # previous order leaked one fd per failed chunk, which on a fresh
+        # backfill with ~1300 EDEADLKs would hit EMFILE and silently
+        # break later copies and logging in the same run.
+        with open(src, "rb") as fh_src:
+            # O_CREAT mode 0o600 forces a private-by-default permission on
+            # the mirrored file regardless of the process umask -- the
+            # data was private in iCloud's TCC container and should stay
+            # private in the mirror.
+            tmp_fd = os.open(tmp, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+            try:
+                fh_dst = os.fdopen(tmp_fd, "wb")
+            except OSError:
+                os.close(tmp_fd)
+                raise
+            with fh_dst:
+                while True:
+                    buf = fh_src.read(65536)
+                    if not buf:
+                        break
+                    fh_dst.write(buf)
+                s = os.fstat(fh_src.fileno())  # the file we actually read
         # ns= form so the stamped mtime matches _needs_copy's nanosecond
         # comparison; the (float, float) form rounds to filesystem-native
         # precision and would mismatch on later ticks.
@@ -2611,20 +2624,13 @@ def _do_mirror(source_dir: str, dest_root: str, log_enabled: bool) -> int:
     chunks_skipped = 0
     errors = 0
 
-    if _needs_copy(src_manifest, dst_manifest):
-        try:
-            _atomic_copy(src_manifest, dst_manifest)
-            copied_manifest = True
-        except OSError as exc:
-            errors += 1
-            if log_enabled:
-                _mirror_log(dest_root, f"manifest copy failed: {exc}")
-
-    # Try listdir directly rather than gating on os.path.isdir(): a TCC denial
-    # on the stat() that backs isdir() would otherwise look identical to a
-    # missing days/ dir, silently producing a manifest-only mirror with
-    # errors=0. Distinguish FileNotFoundError (truly absent) from other OSError
-    # (permission or coordination failure -- a real problem to surface).
+    # PHASE 1 -- copy day chunks BEFORE replacing the manifest. The manifest
+    # is the index readers consult to find days/*.json; publishing a fresh
+    # manifest while one of its referenced chunks failed to copy would let
+    # a reader auto-prefer the mirror, look up a day from the new manifest,
+    # find no/old chunk, and silently produce a partial answer
+    # (_expand_manifest_chunks skips missing chunks on purpose). Mirror the
+    # chunks first so the manifest's promises are never ahead of reality.
     src_days = os.path.join(source_dir, "days")
     try:
         entries = sorted(os.listdir(src_days))
@@ -2657,6 +2663,29 @@ def _do_mirror(source_dir: str, dest_root: str, log_enabled: bool) -> int:
                     _mirror_log(dest_root, f"chunk {name} copy failed: {exc}{hint}")
         else:
             chunks_skipped += 1
+
+    # PHASE 2 -- publish the manifest only if every chunk we touched
+    # succeeded. If anything failed (TCC, EIO, ...), keep the previous
+    # manifest in place so readers continue to see a self-consistent
+    # snapshot until the next tick resolves the failures. A reader that
+    # follows the OLD manifest may miss the latest day's data, but the
+    # rest of the snapshot remains coherent -- strictly better than
+    # serving a NEW manifest that points at days we did not copy.
+    if _needs_copy(src_manifest, dst_manifest):
+        if errors == 0:
+            try:
+                _atomic_copy(src_manifest, dst_manifest)
+                copied_manifest = True
+            except OSError as exc:
+                errors += 1
+                if log_enabled:
+                    _mirror_log(dest_root, f"manifest copy failed: {exc}")
+        else:
+            if log_enabled:
+                _mirror_log(
+                    dest_root,
+                    f"manifest publication deferred: {errors} chunk error(s) this tick",
+                )
 
     if log_enabled:
         _mirror_log(
@@ -2988,11 +3017,20 @@ def _install_shell_hook(rc_path: str, mirror_root: str, source_dir: str) -> int:
         python_path, examine_path, source_dir, mirror_root,
     )
 
+    # Preserve the existing rc file's mode (0o600 etc.) so users who store
+    # secrets in their rc do not see their file demoted to 0o644 by our
+    # temp-file + replace. If the rc did not exist, create it 0o600 -- rc
+    # files commonly hold tokens and 0o644-default is the wrong choice.
+    try:
+        existing_mode = os.stat(rc_path).st_mode & 0o777
+    except OSError:
+        existing_mode = 0o600
     try:
         os.makedirs(os.path.dirname(rc_path) or ".", exist_ok=True)
         tmp = rc_path + ".tmp.healthdrop"
         with open(tmp, "w", encoding="utf-8") as fh:
             fh.write(new_content)
+        os.chmod(tmp, existing_mode)
         os.replace(tmp, rc_path)
     except OSError as exc:
         print(f"could not write {rc_path}: {exc}")
@@ -3033,8 +3071,17 @@ def _install_shell_hook(rc_path: str, mirror_root: str, source_dir: str) -> int:
     print("  - Trade-off vs launchd mode: the mirror only refreshes when you")
     print("    open a new shell, not every 120s. Fine for most use cases.")
     print()
+    # First-tick command bakes in the configured paths -- without --source
+    # and --dest a custom-mirror-root install would populate the default
+    # ~/.healthdrop on the verification run (a different mirror than the
+    # snippet writes), making the immediate tail show errors / nothing.
     print("Trigger the first tick now:")
-    print(f"  {python_path} {examine_path} mirror --lock --log")
+    print(
+        f"  {python_path} {examine_path} mirror"
+        f" --source {source_dir!r}"
+        f" --dest {mirror_root!r}"
+        f" --lock --log"
+    )
     print(f"  tail -1 {mirror_root}/mirror-log.txt   # expect errors=0")
     print()
     # The custom --shell-rc must round-trip through --uninstall, otherwise the
@@ -3063,9 +3110,14 @@ def _uninstall_shell_hook(rc_path: str) -> bool:
         return False  # no block found
 
     try:
+        existing_mode = os.stat(rc_path).st_mode & 0o777
+    except OSError:
+        existing_mode = 0o600
+    try:
         tmp = rc_path + ".tmp.healthdrop"
         with open(tmp, "w", encoding="utf-8") as fh:
             fh.write(cleaned)
+        os.chmod(tmp, existing_mode)  # preserve rc perms; never demote 0o600 to 0o644
         os.replace(tmp, rc_path)
     except OSError as exc:
         print(f"could not write {rc_path}: {exc}")

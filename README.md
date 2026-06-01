@@ -83,7 +83,10 @@ shell, not on a fixed interval. Fine for most cases — open a terminal once a
 day and OpenClaw's queries get fresh data the rest of the day.
 
 Use `--shell-rc /path/to/rc` to manage a non-default rc file (e.g.
-`~/.bashrc`, `~/.config/fish/config.fish`).
+`~/.bashrc`). The snippet uses POSIX subshell-and-background syntax, so
+fish rc files are not supported — fish users should run
+`examine.py mirror --lock --log` manually or wire it into their
+`config.fish` by hand.
 
 ### Mode A — launchd user agent (refreshes every 120s; requires FDA)
 
