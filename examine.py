@@ -2474,12 +2474,37 @@ def _icloud_documents_dir() -> str:
     return os.path.dirname(os.path.expanduser(ICLOUD_INPUT))
 
 
+def _ensure_private_mirror_dirs(mirror_root: str) -> None:
+    """Create mirror_root + mirror_root/days as private (0o700) directories.
+
+    The mirror holds raw HealthKit data that previously lived inside a
+    TCC-protected iCloud container. A default umask of 022 would leave the
+    mirror dir as 0o755 and any other local account / process could list
+    contents. Tighten to 0o700 on create AND on existing dirs we own --
+    we created them, so this isn't surprising user state.
+    """
+    days = os.path.join(mirror_root, "days")
+    os.makedirs(mirror_root, mode=0o700, exist_ok=True)
+    os.makedirs(days, mode=0o700, exist_ok=True)
+    for d in (mirror_root, days):
+        try:
+            if os.stat(d).st_mode & 0o077:
+                os.chmod(d, 0o700)
+        except OSError:
+            pass  # best-effort; permission tightening is hygiene, not load-bearing
+
+
 def _mirror_log(dest_root: str, message: str) -> None:
-    """Append a timestamped line to the mirror's own log. Best-effort."""
+    """Append a timestamped line to the mirror's own log. Best-effort.
+
+    Opens with mode 0o600 so a fresh log file is not world-readable even if
+    the mirror dir's parent ended up group/other readable.
+    """
     log_path = os.path.join(dest_root, "mirror-log.txt")
     try:
         ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
-        with open(log_path, "a", encoding="utf-8") as fh:
+        fd = os.open(log_path, os.O_CREAT | os.O_WRONLY | os.O_APPEND, 0o600)
+        with os.fdopen(fd, "a", encoding="utf-8") as fh:
             fh.write(f"{ts} {message}\n")
     except OSError:
         pass  # logging is best-effort; never block the mirror
@@ -2524,7 +2549,12 @@ def _atomic_copy(src: str, dst: str) -> None:
     """
     tmp = dst + ".tmp"
     try:
-        with open(src, "rb") as fh_src, open(tmp, "wb") as fh_dst:
+        # O_CREAT mode 0o600 forces a private-by-default permission on the
+        # mirrored file regardless of the process umask -- the data was
+        # private in iCloud's TCC container and should stay private in the
+        # mirror.
+        tmp_fd = os.open(tmp, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+        with open(src, "rb") as fh_src, os.fdopen(tmp_fd, "wb") as fh_dst:
             while True:
                 buf = fh_src.read(65536)
                 if not buf:
@@ -2553,7 +2583,7 @@ def _do_mirror(source_dir: str, dest_root: str, log_enabled: bool) -> int:
     source_dir = os.path.expanduser(source_dir)
     dest_root = os.path.expanduser(dest_root)
     dest_days = os.path.join(dest_root, "days")
-    os.makedirs(dest_days, exist_ok=True)
+    _ensure_private_mirror_dirs(dest_root)
 
     src_manifest = os.path.join(source_dir, "healthdrop.json")
     try:
@@ -2667,7 +2697,7 @@ def cmd_mirror(argv: list[str]) -> int:
 
     if args.lock:
         import fcntl
-        os.makedirs(dest_root, exist_ok=True)
+        _ensure_private_mirror_dirs(dest_root)
         lock_path = os.path.join(dest_root, ".mirror.lock")
         lock_fd = os.open(lock_path, os.O_CREAT | os.O_WRONLY, 0o600)
         try:
@@ -2694,7 +2724,7 @@ def _install_mirror_agent(mirror_root: str, source_dir: str, interval: int) -> i
     # HEALTHDROP_EXPORT_PATH hint that resolve_input() reads.
     mirror_root = os.path.abspath(os.path.expanduser(mirror_root))
     source_dir = os.path.abspath(os.path.expanduser(source_dir))
-    os.makedirs(os.path.join(mirror_root, "days"), exist_ok=True)
+    _ensure_private_mirror_dirs(mirror_root)
 
     plist_path = _plist_path()
     os.makedirs(os.path.dirname(plist_path), exist_ok=True)
@@ -2710,6 +2740,11 @@ def _install_mirror_agent(mirror_root: str, source_dir: str, interval: int) -> i
             "mirror",
             "--source", source_dir,
             "--dest", mirror_root,
+            # --lock: when launchd is the sole writer this is a no-op (no
+            # other holder), but if the user also installs the --shell hook
+            # both writers target the same dest and would otherwise race on
+            # `.tmp` rename. fcntl makes them serialise harmlessly.
+            "--lock",
             "--log",
         ],
         "RunAtLoad": True,
@@ -2730,7 +2765,8 @@ def _install_mirror_agent(mirror_root: str, source_dir: str, interval: int) -> i
     print(f"  source dir : {source_dir}")
     print(f"  mirror dir : {mirror_root}")
     print(f"  interval   : every {interval}s")
-    if mirror_root != os.path.expanduser("~/.healthdrop"):
+    default_mirror = os.path.abspath(os.path.expanduser("~/.healthdrop"))
+    if mirror_root != default_mirror:
         # resolve_input() only auto-prefers ~/.healthdrop/healthdrop.json. A
         # custom mirror root is invisible to it, so default-path queries
         # would still try the iCloud container and hit the same TCC wall.
@@ -2740,6 +2776,21 @@ def _install_mirror_agent(mirror_root: str, source_dir: str, interval: int) -> i
         print(f"      ~/.healthdrop -- so set HEALTHDROP_EXPORT_PATH to make")
         print(f"      readers find this mirror:")
         print(f"        export HEALTHDROP_EXPORT_PATH={mirror_root}/healthdrop.json")
+
+    # Cross-variant disclosure: if the user already has a shell hook installed
+    # somewhere, both variants will write to the same dest. --lock makes them
+    # safe, but redundant; surface so the user can clean up if they meant to
+    # switch modes.
+    hook_rcs = [rc for rc in _candidate_shell_rcs()
+                if _rc_has_hook_block(rc)]
+    if hook_rcs:
+        print()
+        print("NOTE: a shell hook is also installed at:")
+        for rc in hook_rcs:
+            print(f"        {rc}")
+        print("      Both variants can coexist (both use --lock) but they're")
+        print("      redundant. To drop the shell hook(s):")
+        print(f"        python3 {examine_path} setup-mirror --uninstall")
     print()
     print("Required next steps (run in this order):")
     print()
@@ -2806,8 +2857,43 @@ SHELL_HOOK_END = "# <<< healthdrop mirror <<<"
 
 def _default_shell_rc() -> str:
     """Pick the default rc file to manage. zsh is macOS's default since
-    Catalina; bash / fish users can override with --shell-rc."""
+    Catalina; bash users can override with --shell-rc.
+
+    Fish is intentionally NOT supported via --shell -- the snippet uses
+    POSIX subshell-and-background syntax that fish does not parse.
+    """
     return os.path.expanduser("~/.zshrc")
+
+
+def _candidate_shell_rcs() -> list[str]:
+    """All POSIX rc files a previous --shell install may have written to.
+
+    Used by `--uninstall` (without an explicit --shell-rc) to scan and
+    clean every plausible location, so a user who installed via
+    `--shell-rc ~/.bashrc` and later runs `--uninstall` without the same
+    flag still ends up with a clean rc set.
+    """
+    return [os.path.expanduser(p) for p in (
+        "~/.zshrc",
+        "~/.bashrc",
+        "~/.bash_profile",
+        "~/.profile",
+    )]
+
+
+def _is_fish_rc(rc_path: str) -> bool:
+    p = rc_path.lower()
+    return p.endswith(".fish") or "/fish/" in p
+
+
+def _rc_has_hook_block(rc_path: str) -> bool:
+    """True iff the sentinel BEGIN marker appears in rc_path. Cheap check
+    used by the cross-variant warning."""
+    try:
+        with open(rc_path, "r", encoding="utf-8") as fh:
+            return SHELL_HOOK_BEGIN in fh.read()
+    except OSError:
+        return False
 
 
 def _shell_quote(s: str) -> str:
@@ -2863,12 +2949,24 @@ def _strip_hook_block(content: str) -> str:
 
 
 def _install_shell_hook(rc_path: str, mirror_root: str, source_dir: str) -> int:
+    if _is_fish_rc(rc_path):
+        # The snippet uses POSIX `( cmd & ) 2>/dev/null` subshell-and-background
+        # syntax which fish does not parse the same way. Rather than ship a
+        # half-working fish hook, refuse and suggest an explicit path.
+        print(f"--shell does not support fish rc files yet: {rc_path}")
+        print()
+        print("The default snippet is POSIX-only (zsh/bash). For fish, run the")
+        print(f"mirror manually from a fish prompt instead:")
+        print(f"  {sys.executable} {os.path.abspath(__file__)} mirror --lock --log")
+        print("or set up a fish-native background invocation in your config.fish.")
+        return 1
+
     # abspath() after expanduser() so the snippet records a stable absolute
     # path; the rc file is sourced from arbitrary cwds across new shells and
     # a relative path would silently rebind the mirror per session.
     mirror_root = os.path.abspath(os.path.expanduser(mirror_root))
     source_dir = os.path.abspath(os.path.expanduser(source_dir))
-    os.makedirs(os.path.join(mirror_root, "days"), exist_ok=True)
+    _ensure_private_mirror_dirs(mirror_root)
 
     examine_path = os.path.abspath(__file__)
     python_path = sys.executable
@@ -2906,6 +3004,26 @@ def _install_shell_hook(rc_path: str, mirror_root: str, source_dir: str) -> int:
     print(f"  examine    : {examine_path}")
     print(f"  source dir : {source_dir}")
     print(f"  mirror dir : {mirror_root}")
+
+    default_mirror = os.path.abspath(os.path.expanduser("~/.healthdrop"))
+    if mirror_root != default_mirror:
+        # Same disclosure the launchd installer prints: resolve_input() only
+        # auto-prefers the hard-coded ~/.healthdrop default, so a custom
+        # --mirror-root needs an env override to be visible to readers.
+        print()
+        print("NOTE: non-default mirror dir. Auto-prefer logic only sees")
+        print(f"      ~/.healthdrop -- so set HEALTHDROP_EXPORT_PATH to make")
+        print(f"      readers find this mirror:")
+        print(f"        export HEALTHDROP_EXPORT_PATH={mirror_root}/healthdrop.json")
+
+    if os.path.exists(_plist_path()):
+        print()
+        print("NOTE: a launchd mirror agent is also installed. Both variants")
+        print("      can coexist (both use --lock) but they're redundant. To")
+        print("      drop the launchd one:")
+        print(f"        launchctl bootout gui/{os.getuid()}/{MIRROR_LABEL}")
+        print(f"        rm {_plist_path()}")
+
     print()
     print("How it works:")
     print("  - Every new interactive shell fires `mirror --lock --log` in the")
@@ -2919,7 +3037,13 @@ def _install_shell_hook(rc_path: str, mirror_root: str, source_dir: str) -> int:
     print(f"  {python_path} {examine_path} mirror --lock --log")
     print(f"  tail -1 {mirror_root}/mirror-log.txt   # expect errors=0")
     print()
-    print(f"To remove: python3 {examine_path} setup-mirror --uninstall")
+    # The custom --shell-rc must round-trip through --uninstall, otherwise the
+    # default scan only covers ~/.zshrc + the bash family and leaves the hook
+    # alive in places like ~/.config/zsh/.zshrc.
+    if rc_path == _default_shell_rc():
+        print(f"To remove: python3 {examine_path} setup-mirror --uninstall")
+    else:
+        print(f"To remove: python3 {examine_path} setup-mirror --uninstall --shell-rc {rc_path}")
     return 0
 
 
@@ -2985,10 +3109,21 @@ def cmd_setup_mirror(argv: list[str]) -> int:
         # both) the user originally installed. Each helper is a no-op if the
         # corresponding artefact is absent.
         plist_code = _uninstall_mirror_agent()
-        if _uninstall_shell_hook(rc_path):
-            print(f"removed shell hook block from {rc_path}")
-        else:
-            print(f"no shell hook block found in {rc_path}")
+        # If the user gave an explicit --shell-rc, only touch that file.
+        # Otherwise scan every POSIX rc this installer could have written
+        # to, so an earlier `--shell --shell-rc ~/.bashrc` install still
+        # cleans up when the user later runs `--uninstall` without the
+        # flag. Without this scan, a hook in .bashrc would keep spawning
+        # mirror ticks forever.
+        rcs = [rc_path] if args.shell_rc else _candidate_shell_rcs()
+        removed_any = False
+        for rc in rcs:
+            if _uninstall_shell_hook(rc):
+                print(f"removed shell hook block from {rc}")
+                removed_any = True
+        if not removed_any:
+            target = rc_path if args.shell_rc else "any known rc"
+            print(f"no shell hook block found in {target}")
         return plist_code
 
     source = args.source or _icloud_documents_dir()
