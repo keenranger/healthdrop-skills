@@ -2029,40 +2029,83 @@ def _build_index(db_path: str, data: dict, sig: str) -> None:
 
 
 def _input_signature(path: str) -> Optional[str]:
-    """Compose a cache key from the manifest + days/ state.
+    """Compose a cache key from the manifest + every chunk it references.
 
     Including the days/ dir mtime catches add/remove/rename of chunks (e.g.
-    a mirror tick that brings in new day files after a partial first run);
-    including the newest-chunk mtime catches in-place rewrites of today's
-    chunk (the only chunk HealthDrop's background observer mutates after
-    creation). Without these, a query against a v4 manifest+chunks layout
-    can return a stale SQLite index when the chunks evolve but the manifest
-    file itself doesn't.
+    a mirror tick that brings in new day files after a partial first run).
+    Folding the (basename, size, mtime_ns) of every manifest-referenced
+    chunk into a sha256 catches in-place rewrites of ANY chunk -- not just
+    the latest day. The previous "latest_chunk only" signature missed
+    historical HealthKit corrections, deletions, and backfills (those edit
+    a non-latest chunk in place; the days/ dir mtime does not bump and the
+    manifest file may not change either), so the SQLite index could stay
+    stale against the rewritten chunk.
+
+    Hashing keeps the signature fixed-length even for multi-year exports
+    (~1500+ chunks); we only stat the chunks the manifest actually names,
+    so cost scales with declared days, not with the dir contents. On any
+    parse/stat failure we degrade gracefully to the legacy dir+latest
+    signature so the cache check never crashes a query.
     """
     try:
         st = os.stat(path)
     except OSError:
         return None
     parts = [f"manifest:{st.st_size}:{st.st_mtime_ns}"]
-    days_dir = os.path.join(os.path.dirname(os.path.abspath(path)), "days")
+    base_dir = os.path.dirname(os.path.abspath(path))
+    days_dir = os.path.join(base_dir, "days")
     try:
         days_st = os.stat(days_dir)
     except OSError:
         return "|".join(parts)
     parts.append(f"days_dir:{days_st.st_mtime_ns}")
+    # Walk the manifest's declared chunks and fold each chunk's identity
+    # into a sha256 digest. This is the only thing that catches an
+    # in-place rewrite of a non-latest chunk.
     try:
-        entries = [n for n in os.listdir(days_dir) if n.endswith(".json")]
-    except OSError:
-        return "|".join(parts)
-    if entries:
-        # The lexicographically-largest YYYY-MM-DD.json is always the latest
-        # day -- which is the only chunk that mutates in place after creation.
-        latest = max(entries)
+        with open(path, "rb") as fh:
+            manifest = json.loads(fh.read())
+    except (OSError, json.JSONDecodeError):
+        manifest = None
+    referenced: list[str] = []
+    if isinstance(manifest, dict):
+        days_entries = manifest.get("days")
+        if isinstance(days_entries, list):
+            chunk_hash = hashlib.sha256()
+            for entry in days_entries:
+                if not isinstance(entry, dict):
+                    continue
+                rel = entry.get("path")
+                if not isinstance(rel, str) or not rel:
+                    continue
+                basename = os.path.basename(rel)
+                referenced.append(basename)
+                chunk_path = os.path.join(base_dir, rel)
+                try:
+                    cst = os.stat(chunk_path)
+                except OSError:
+                    chunk_hash.update(f"{basename}:missing\n".encode("utf-8"))
+                    continue
+                chunk_hash.update(
+                    f"{basename}:{cst.st_size}:{cst.st_mtime_ns}\n".encode("utf-8")
+                )
+            parts.append(f"chunks_sha256:{chunk_hash.hexdigest()}")
+    if not referenced:
+        # Manifest unreadable or non-v4 -- fall back to the legacy
+        # latest-chunk hint so we still detect today's chunk mutating.
         try:
-            latest_mtime_ns = os.stat(os.path.join(days_dir, latest)).st_mtime_ns
-            parts.append(f"latest_chunk:{latest}:{latest_mtime_ns}")
+            entries = [n for n in os.listdir(days_dir) if n.endswith(".json")]
         except OSError:
-            pass
+            return "|".join(parts)
+        if entries:
+            latest = max(entries)
+            try:
+                latest_mtime_ns = os.stat(
+                    os.path.join(days_dir, latest)
+                ).st_mtime_ns
+                parts.append(f"latest_chunk:{latest}:{latest_mtime_ns}")
+            except OSError:
+                pass
     return "|".join(parts)
 
 
@@ -2494,23 +2537,29 @@ def _ensure_private_mirror_dirs(mirror_root: str) -> None:
             pass  # best-effort; permission tightening is hygiene, not load-bearing
 
 
-def _verify_manifest_against_mirror(src_manifest: str, dest_days: str) -> Optional[str]:
+def _verify_manifest_against_mirror(
+    src_manifest: str, dest_days: str, source_days: str,
+) -> Optional[str]:
     """Cheap pre-publication check: does the source manifest's days list
-    match files already in the mirror's days/ dir?
+    match files we already have in the mirror's days/ dir?
 
-    Returns None if everything lines up, or a short reason string describing
-    the first mismatch. Catches the TOCTOU window between phase 1 (chunk
-    copy) and phase 2 (manifest publish): if iCloud delivered a fresh
-    manifest mid-tick that references chunks we did not copy (or copied a
-    previous version of), publishing it would let _expand_manifest_chunks()
-    silently skip the missing/short ones and lie to readers.
+    Returns None if publication is safe, or a short reason string for the
+    first blocking mismatch. The job is to catch the TOCTOU window between
+    phase 1 (chunk copy) and phase 2 (manifest publish) WITHOUT
+    false-positive deferring on producer-side metadata drift.
 
-    Compares `sizeBytes` -- per-chunk byte counts the producer recorded --
-    against the mirror's local file sizes. sha256 verification would be
-    stronger but costs a full file read per chunk per tick. Size catches
-    the most common drift (new chunk arrived, growing chunk hasn't fully
-    re-synced) without that cost; if a same-size rewrite slips through,
-    the next tick's mtime-driven copy still catches it.
+    Three cases when manifest `sizeBytes` != mirror chunk size:
+      (a) chunk missing from mirror -- always defer (reader would silently
+          get partial data via _expand_manifest_chunks)
+      (b) source chunk's actual size also disagrees with the manifest --
+          the producer's per-entry sizeBytes is just stale (HealthDrop in
+          practice records sizes that are not always re-stamped when the
+          chunk is rewritten). Mirror correctly mirrors what's on iCloud,
+          so publishing is safe -- readers will read the same bytes
+          they'd read directly from the source.
+      (c) source and mirror disagree -- our phase 1 missed a fresh
+          version of the chunk. Defer; the next tick's mtime-driven copy
+          picks it up.
     """
     try:
         with open(src_manifest, "rb") as fh:
@@ -2540,14 +2589,31 @@ def _verify_manifest_against_mirror(src_manifest: str, dest_days: str) -> Option
         try:
             actual_size = os.stat(local).st_size
         except FileNotFoundError:
+            # Case (a)
             return f"manifest references {basename} which is not mirrored"
         except OSError as exc:
             return f"mirror chunk {basename} unstatable: {exc}"
-        if actual_size != expected_size:
+        if actual_size == expected_size:
+            continue
+        # Manifest disagrees with mirror. Consult the source chunk to
+        # disambiguate (b) vs (c).
+        try:
+            src_size = os.stat(os.path.join(source_days, basename)).st_size
+        except OSError:
+            # Source unstatable -- conservative: defer.
             return (
                 f"chunk {basename} size mismatch: manifest={expected_size}"
-                f" mirror={actual_size}"
+                f" mirror={actual_size} (source unstatable)"
             )
+        if src_size == actual_size:
+            # Case (b): mirror matches source; manifest metadata is stale.
+            # Publish; reader will read the same bytes that are on iCloud.
+            continue
+        # Case (c)
+        return (
+            f"chunk {basename} size: manifest={expected_size}"
+            f" mirror={actual_size} source={src_size}"
+        )
     return None
 
 
@@ -2583,6 +2649,43 @@ def _needs_copy(src: str, dst: str) -> bool:
     except OSError:
         return True
     return s_src.st_size != s_dst.st_size or s_src.st_mtime_ns != s_dst.st_mtime_ns
+
+
+def _stage_source_file(src: str, staged_tmp: str) -> None:
+    """Copy src bytes into staged_tmp, preserving mtime, WITHOUT promoting.
+
+    Used by phase 2 of _do_mirror to capture the manifest bytes once so the
+    same staged file can be both verified and (if it passes) promoted to
+    the final destination. Closes the TOCTOU window where verifying src by
+    path and then re-opening src by path lets iCloud swap the file between
+    the two opens.
+
+    Same shape as _atomic_copy minus the os.replace(): on OSError, the
+    .tmp is unlinked and the exception re-raised. 0o600 like everything
+    else in the mirror.
+    """
+    try:
+        with open(src, "rb") as fh_src:
+            tmp_fd = os.open(staged_tmp, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+            try:
+                fh_dst = os.fdopen(tmp_fd, "wb")
+            except OSError:
+                os.close(tmp_fd)
+                raise
+            with fh_dst:
+                while True:
+                    buf = fh_src.read(65536)
+                    if not buf:
+                        break
+                    fh_dst.write(buf)
+                s = os.fstat(fh_src.fileno())
+        os.utime(staged_tmp, ns=(s.st_atime_ns, s.st_mtime_ns))
+    except OSError:
+        try:
+            os.unlink(staged_tmp)
+        except OSError:
+            pass
+        raise
 
 
 def _atomic_copy(src: str, dst: str) -> None:
@@ -2738,26 +2841,53 @@ def _do_mirror(source_dir: str, dest_root: str, log_enabled: bool) -> int:
                     f"manifest publication deferred: {errors} chunk error(s) this tick",
                 )
         else:
-            mismatch_reason = _verify_manifest_against_mirror(src_manifest, dest_days)
-            if mismatch_reason is not None:
-                # Manifest references chunks we didn't (yet) mirror correctly
-                # -- could be a fresh export landed mid-tick whose new chunks
-                # haven't synced from iCloud yet, or a chunk we copied was
-                # rewritten on the source between phase 1 and now.
+            # TOCTOU fix: stage src_manifest into a verified-temp file FIRST,
+            # verify the staged bytes, then atomically promote the SAME bytes
+            # to dst_manifest. Previously we verified src by path and then
+            # _atomic_copy reopened src by path -- iCloud could swap the
+            # file between those two opens, letting us publish a manifest
+            # whose chunk promises we never actually verified.
+            staged_tmp = dst_manifest + ".tmp"
+            staged_ok = False
+            try:
+                _stage_source_file(src_manifest, staged_tmp)
+                staged_ok = True
+            except OSError as exc:
                 errors += 1
                 if log_enabled:
-                    _mirror_log(
-                        dest_root,
-                        f"manifest publication deferred: {mismatch_reason}",
-                    )
-            else:
-                try:
-                    _atomic_copy(src_manifest, dst_manifest)
-                    copied_manifest = True
-                except OSError as exc:
+                    _mirror_log(dest_root, f"manifest stage failed: {exc}")
+            if staged_ok:
+                mismatch_reason = _verify_manifest_against_mirror(
+                    staged_tmp, dest_days, src_days,
+                )
+                if mismatch_reason is not None:
+                    # Staged manifest references chunks we didn't (yet)
+                    # mirror correctly -- could be a fresh export landed
+                    # mid-tick whose new chunks haven't synced from iCloud
+                    # yet, or a chunk we copied was rewritten on the source
+                    # between phase 1 and now.
                     errors += 1
                     if log_enabled:
-                        _mirror_log(dest_root, f"manifest copy failed: {exc}")
+                        _mirror_log(
+                            dest_root,
+                            f"manifest publication deferred: {mismatch_reason}",
+                        )
+                    try:
+                        os.unlink(staged_tmp)
+                    except OSError:
+                        pass
+                else:
+                    try:
+                        os.replace(staged_tmp, dst_manifest)
+                        copied_manifest = True
+                    except OSError as exc:
+                        errors += 1
+                        if log_enabled:
+                            _mirror_log(dest_root, f"manifest promote failed: {exc}")
+                        try:
+                            os.unlink(staged_tmp)
+                        except OSError:
+                            pass
 
     if log_enabled:
         _mirror_log(
@@ -2876,7 +3006,9 @@ def _install_mirror_agent(mirror_root: str, source_dir: str, interval: int) -> i
         print("NOTE: non-default mirror dir. Auto-prefer logic only sees")
         print(f"      ~/.healthdrop -- so set HEALTHDROP_EXPORT_PATH to make")
         print(f"      readers find this mirror:")
-        print(f"        export HEALTHDROP_EXPORT_PATH={mirror_root}/healthdrop.json")
+        # Quote the path: mirror_root may contain spaces or shell metacharacters,
+        # which would otherwise split the export line apart when pasted.
+        print(f"        export HEALTHDROP_EXPORT_PATH={_shell_quote(os.path.join(mirror_root, 'healthdrop.json'))}")
 
     # Cross-variant disclosure: if the user already has a shell hook installed
     # somewhere, both variants will write to the same dest. --lock makes them
@@ -2903,6 +3035,13 @@ def _install_mirror_agent(mirror_root: str, source_dir: str, interval: int) -> i
     print()
     print("2. Load the agent and trigger the first tick:")
     print()
+    # bootout first so a reinstall picks up the new ProgramArguments
+    # (--interval / --source / --mirror-root). bootstrap is a no-op if
+    # the label is already loaded, which means launchd would otherwise
+    # keep the previous in-memory plist and silently ignore the edit.
+    # On a first install bootout exits non-zero with "No such process";
+    # that is expected, hence the `|| true`.
+    print(f"     launchctl bootout gui/{uid}/{MIRROR_LABEL} || true   # ignore 'No such process' on a first install")
     print(f"     launchctl bootstrap gui/{uid} {plist_path}")
     print(f"     launchctl kickstart -k gui/{uid}/{MIRROR_LABEL}")
     print()
@@ -3045,15 +3184,44 @@ def _strip_hook_block(content: str) -> str:
     handle this as a non-fatal "refusing to touch" so the user can fix
     by hand.
     """
-    has_begin = SHELL_HOOK_BEGIN in content
-    has_end = SHELL_HOOK_END in content
-    if has_begin != has_end:
-        raise _MalformedHookBlock(
-            "BEGIN sentinel without matching END" if has_begin
-            else "END sentinel without matching BEGIN"
-        )
-    if not has_begin:
+    # Walk the file line-by-line and verify each BEGIN is closed by an END
+    # before the next BEGIN appears, and that no END appears outside a block.
+    # A simple "are both substrings present?" check (the previous impl) lets
+    # BEGIN-BEGIN-END or END-before-BEGIN slip through, after which the strip
+    # loop happily drops every user line under an orphan BEGIN.
+    skip = False
+    begin_count = 0
+    end_count = 0
+    for line in content.splitlines(keepends=True):
+        stripped = line.strip()
+        if stripped == SHELL_HOOK_BEGIN:
+            if skip:
+                # nested / unclosed BEGIN: previous block was never terminated
+                raise _MalformedHookBlock(
+                    "BEGIN sentinel without matching END"
+                )
+            skip = True
+            begin_count += 1
+            continue
+        if stripped == SHELL_HOOK_END:
+            if not skip:
+                # END before any BEGIN, or a second END after the block closed
+                raise _MalformedHookBlock(
+                    "END sentinel without matching BEGIN"
+                )
+            skip = False
+            end_count += 1
+            continue
+    if skip:
+        # walked off EOF while still inside a block
+        raise _MalformedHookBlock("BEGIN sentinel without matching END")
+    if begin_count == 0:
+        # no block present and no orphan markers -- return unchanged so the
+        # rc's mtime / signing state is preserved on a no-op uninstall.
         return content
+
+    # Markers balance. Do the actual strip pass. Same shape as the validator
+    # above so behavior stays in lock-step if the sentinels ever change.
     out: list[str] = []
     skip = False
     for line in content.splitlines(keepends=True):
@@ -3153,7 +3321,9 @@ def _install_shell_hook(rc_path: str, mirror_root: str, source_dir: str) -> int:
         print("NOTE: non-default mirror dir. Auto-prefer logic only sees")
         print(f"      ~/.healthdrop -- so set HEALTHDROP_EXPORT_PATH to make")
         print(f"      readers find this mirror:")
-        print(f"        export HEALTHDROP_EXPORT_PATH={mirror_root}/healthdrop.json")
+        # Quote the path: mirror_root may contain spaces or shell metacharacters,
+        # which would otherwise split the export line apart when pasted.
+        print(f"        export HEALTHDROP_EXPORT_PATH={_shell_quote(os.path.join(mirror_root, 'healthdrop.json'))}")
 
     if os.path.exists(_plist_path()):
         print()
