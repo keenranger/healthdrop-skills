@@ -2591,28 +2591,49 @@ def _verify_manifest_against_mirror(
         basename = os.path.basename(rel)
         local = os.path.join(dest_days, basename)
         try:
-            actual_size = os.stat(local).st_size
+            local_st = os.stat(local)
+            actual_size = local_st.st_size
         except FileNotFoundError:
             # Case (a)
             return f"manifest references {basename} which is not mirrored"
         except OSError as exc:
             return f"mirror chunk {basename} unstatable: {exc}"
-        if actual_size == expected_size:
-            continue
-        # Manifest disagrees with mirror. Consult the source chunk to
-        # disambiguate (b) vs (c).
+        # Always cross-check the source chunk's CURRENT mtime against the
+        # mirror's mtime. _atomic_copy preserved source mtime when we copied,
+        # so equal-size + equal-mtime means the mirror still matches what
+        # iCloud has. Equal-size + DIFFERENT-mtime is the same-size-rewrite
+        # race: source was atomically rewritten after our phase 1 copy with
+        # different content but identical byte length, which the size check
+        # alone cannot see. (HealthDrop's `sha256` field would have caught
+        # this in principle, but it ships as stale 32-bit prefixes in
+        # practice; mtime parity is reliable because we control the dest
+        # mtime via os.utime in _atomic_copy.)
+        src_path = os.path.join(source_days, basename)
         try:
-            src_size = os.stat(os.path.join(source_days, basename)).st_size
+            src_st = os.stat(src_path)
         except OSError:
-            # Source unstatable -- conservative: defer.
-            return (
-                f"chunk {basename} size mismatch: manifest={expected_size}"
-                f" mirror={actual_size} (source unstatable)"
-            )
-        if src_size == actual_size:
+            if actual_size != expected_size:
+                return (
+                    f"chunk {basename} size mismatch: manifest={expected_size}"
+                    f" mirror={actual_size} (source unstatable)"
+                )
+            # Mirror agrees with manifest, source unreadable -- publish.
+            continue
+        if actual_size == expected_size:
+            if src_st.st_mtime_ns != local_st.st_mtime_ns:
+                # Same-size rewrite race: source was rewritten after phase 1
+                # with the same length. The next tick's mtime-driven copy
+                # will catch up; defer for now.
+                return (
+                    f"chunk {basename} same-size mtime drift: source rewrote"
+                    f" after phase 1 (will re-copy next tick)"
+                )
+            continue
+        if src_st.st_size == actual_size:
             # Case (b): mirror matches source; manifest metadata is stale.
             # Publish; reader will read the same bytes that are on iCloud.
             continue
+        src_size = src_st.st_size
         # Case (c)
         return (
             f"chunk {basename} size: manifest={expected_size}"
@@ -3059,12 +3080,20 @@ def _install_mirror_agent(mirror_root: str, source_dir: str, interval: int) -> i
     print(f"     launchctl bootstrap gui/{uid} {plist_path}")
     print(f"     launchctl kickstart -k gui/{uid}/{MIRROR_LABEL}")
     print()
+    # Quote any path that might contain spaces / shell metacharacters
+    # (mirror_root, examine_path). Without quoting, a user installed under
+    # ~/Library/Application Support/... gets a verification command whose
+    # tail/ls/python3 args fragment on whitespace and report failure even
+    # though the agent and mirror are healthy.
+    mirror_log = _shell_quote(os.path.join(mirror_root, "mirror-log.txt"))
+    mirror_days = _shell_quote(os.path.join(mirror_root, "days"))
+    examine_q = _shell_quote(examine_path)
     print("3. Verify:")
-    print(f"     tail -1 {mirror_root}/mirror-log.txt   # expect errors=0")
-    print(f"     ls {mirror_root}/days | wc -l           # matches the source count")
-    print(f"     python3 {examine_path} query list   # mirror is auto-preferred")
+    print(f"     tail -1 {mirror_log}   # expect errors=0")
+    print(f"     ls {mirror_days} | wc -l           # matches the source count")
+    print(f"     python3 {examine_q} query list   # mirror is auto-preferred")
     print()
-    print(f"To remove later:  python3 {examine_path} setup-mirror --uninstall")
+    print(f"To remove later:  python3 {examine_q} setup-mirror --uninstall")
     return 0
 
 
@@ -3388,22 +3417,25 @@ def _install_shell_hook(rc_path: str, mirror_root: str, source_dir: str) -> int:
     # and --dest a custom-mirror-root install would populate the default
     # ~/.healthdrop on the verification run (a different mirror than the
     # snippet writes), making the immediate tail show errors / nothing.
+    # Quote every printed path so a mirror_root / source_dir / examine_path
+    # with spaces survives copy-paste.
+    py_q = _shell_quote(python_path)
+    ex_q = _shell_quote(examine_path)
+    src_q = _shell_quote(source_dir)
+    dst_q = _shell_quote(mirror_root)
+    mirror_log = _shell_quote(os.path.join(mirror_root, "mirror-log.txt"))
+    rc_q = _shell_quote(rc_path)
     print("Trigger the first tick now:")
-    print(
-        f"  {python_path} {examine_path} mirror"
-        f" --source {source_dir!r}"
-        f" --dest {mirror_root!r}"
-        f" --lock --log"
-    )
-    print(f"  tail -1 {mirror_root}/mirror-log.txt   # expect errors=0")
+    print(f"  {py_q} {ex_q} mirror --source {src_q} --dest {dst_q} --lock --log")
+    print(f"  tail -1 {mirror_log}   # expect errors=0")
     print()
     # The custom --shell-rc must round-trip through --uninstall, otherwise the
     # default scan only covers ~/.zshrc + the bash family and leaves the hook
     # alive in places like ~/.config/zsh/.zshrc.
     if rc_path == _default_shell_rc():
-        print(f"To remove: python3 {examine_path} setup-mirror --uninstall")
+        print(f"To remove: python3 {ex_q} setup-mirror --uninstall")
     else:
-        print(f"To remove: python3 {examine_path} setup-mirror --uninstall --shell-rc {rc_path}")
+        print(f"To remove: python3 {ex_q} setup-mirror --uninstall --shell-rc {rc_q}")
     return 0
 
 
