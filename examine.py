@@ -2614,7 +2614,8 @@ def cmd_mirror(argv: list[str]) -> int:
     p = argparse.ArgumentParser(
         prog="examine.py mirror",
         description="Copy the iCloud HealthDrop container into a TCC-free mirror dir. "
-                    "Intended to be called by the launchd agent installed via setup-mirror.",
+                    "Intended to be called by the launchd agent or shell hook installed "
+                    "via setup-mirror.",
     )
     p.add_argument("--source", default=None,
                    help="Source iCloud Documents directory (default: canonical container).")
@@ -2622,9 +2623,30 @@ def cmd_mirror(argv: list[str]) -> int:
                    help="Destination mirror directory (default: ~/.healthdrop).")
     p.add_argument("--log", action="store_true",
                    help="Append a one-line tick summary to {dest}/mirror-log.txt.")
+    p.add_argument("--lock", action="store_true",
+                   help="Skip this tick (exit 0) if another mirror is already running. "
+                        "Uses an fcntl exclusive lock on {dest}/.mirror.lock so that "
+                        "concurrent shell opens (the --shell hook flow) don't race.")
     args = p.parse_args(argv)
 
     source = args.source or _icloud_documents_dir()
+    dest_root = os.path.expanduser(args.dest)
+
+    if args.lock:
+        import fcntl
+        os.makedirs(dest_root, exist_ok=True)
+        lock_path = os.path.join(dest_root, ".mirror.lock")
+        lock_fd = os.open(lock_path, os.O_CREAT | os.O_WRONLY, 0o600)
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            # Another mirror is in flight; drop out quietly.
+            os.close(lock_fd)
+            return 0
+        try:
+            return _do_mirror(source, args.dest, args.log)
+        finally:
+            os.close(lock_fd)  # implicit flock release on close
     return _do_mirror(source, args.dest, args.log)
 
 
@@ -2741,28 +2763,197 @@ def _uninstall_mirror_agent() -> int:
     return 0
 
 
+SHELL_HOOK_BEGIN = "# >>> healthdrop mirror (auto-installed by setup-mirror --shell) >>>"
+SHELL_HOOK_END = "# <<< healthdrop mirror <<<"
+
+
+def _default_shell_rc() -> str:
+    """Pick the default rc file to manage. zsh is macOS's default since
+    Catalina; bash / fish users can override with --shell-rc."""
+    return os.path.expanduser("~/.zshrc")
+
+
+def _shell_quote(s: str) -> str:
+    """POSIX-safe single-quote wrap, escaping any embedded single quotes."""
+    return "'" + s.replace("'", "'\"'\"'") + "'"
+
+
+def _build_shell_snippet(python_path: str, examine_path: str,
+                         source_dir: str, mirror_root: str) -> str:
+    """Render the sentinel-delimited block that goes in the rc file.
+
+    source_dir and mirror_root are baked in even when they match defaults
+    so that a future skill update changing the defaults does not silently
+    redirect an already-installed user's mirror.
+    """
+    py = _shell_quote(python_path)
+    script = _shell_quote(examine_path)
+    src = _shell_quote(source_dir)
+    dst = _shell_quote(mirror_root)
+    return (
+        f"{SHELL_HOOK_BEGIN}\n"
+        "# Fire one mirror tick per new interactive shell. Inherits the parent\n"
+        "# Terminal's Full Disk Access via TCC, so no extra grant is needed.\n"
+        "# Background-forked (& inside a subshell) so shell startup is not blocked.\n"
+        f"# Manage: python3 {examine_path} setup-mirror --shell [--uninstall]\n"
+        f"( {py} {script} mirror --source {src} --dest {dst} --lock --log >/dev/null 2>&1 & ) 2>/dev/null\n"
+        f"{SHELL_HOOK_END}\n"
+    )
+
+
+def _strip_hook_block(content: str) -> str:
+    """Remove the sentinel-delimited block from content, if present.
+
+    Leaves the rest of the file byte-identical when no block matches, so a
+    no-op uninstall doesn't rewrite the rc and disturb its mtime / signing
+    state. Idempotent.
+    """
+    if SHELL_HOOK_BEGIN not in content:
+        return content
+    out: list[str] = []
+    skip = False
+    for line in content.splitlines(keepends=True):
+        stripped = line.strip()
+        if stripped == SHELL_HOOK_BEGIN:
+            skip = True
+            continue
+        if stripped == SHELL_HOOK_END:
+            skip = False
+            continue
+        if not skip:
+            out.append(line)
+    return "".join(out)
+
+
+def _install_shell_hook(rc_path: str, mirror_root: str, source_dir: str) -> int:
+    mirror_root = os.path.expanduser(mirror_root)
+    source_dir = os.path.expanduser(source_dir)
+    os.makedirs(os.path.join(mirror_root, "days"), exist_ok=True)
+
+    examine_path = os.path.abspath(__file__)
+    python_path = sys.executable
+
+    existing = ""
+    try:
+        with open(rc_path, "r", encoding="utf-8") as fh:
+            existing = fh.read()
+    except FileNotFoundError:
+        existing = ""
+    except OSError as exc:
+        print(f"could not read {rc_path}: {exc}")
+        return 1
+
+    cleaned = _strip_hook_block(existing)
+    if cleaned and not cleaned.endswith("\n"):
+        cleaned += "\n"
+    new_content = cleaned + _build_shell_snippet(
+        python_path, examine_path, source_dir, mirror_root,
+    )
+
+    try:
+        os.makedirs(os.path.dirname(rc_path) or ".", exist_ok=True)
+        tmp = rc_path + ".tmp.healthdrop"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write(new_content)
+        os.replace(tmp, rc_path)
+    except OSError as exc:
+        print(f"could not write {rc_path}: {exc}")
+        return 1
+
+    print("setup-mirror --shell: installed.")
+    print(f"  rc file    : {rc_path}")
+    print(f"  python     : {python_path}")
+    print(f"  examine    : {examine_path}")
+    print(f"  source dir : {source_dir}")
+    print(f"  mirror dir : {mirror_root}")
+    print()
+    print("How it works:")
+    print("  - Every new interactive shell fires `mirror --lock --log` in the")
+    print("    background. The --lock prevents concurrent shells from racing.")
+    print("  - No extra TCC grant: the mirror inherits the Terminal's existing")
+    print("    Full Disk Access.")
+    print("  - Trade-off vs launchd mode: the mirror only refreshes when you")
+    print("    open a new shell, not every 120s. Fine for most use cases.")
+    print()
+    print("Trigger the first tick now:")
+    print(f"  {python_path} {examine_path} mirror --lock --log")
+    print(f"  tail -1 {mirror_root}/mirror-log.txt   # expect errors=0")
+    print()
+    print(f"To remove: python3 {examine_path} setup-mirror --uninstall")
+    return 0
+
+
+def _uninstall_shell_hook(rc_path: str) -> bool:
+    """Return True if a hook block was found and removed, False otherwise."""
+    try:
+        with open(rc_path, "r", encoding="utf-8") as fh:
+            existing = fh.read()
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        print(f"could not read {rc_path}: {exc}")
+        return False
+
+    cleaned = _strip_hook_block(existing)
+    if cleaned == existing:
+        return False  # no block found
+
+    try:
+        tmp = rc_path + ".tmp.healthdrop"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write(cleaned)
+        os.replace(tmp, rc_path)
+    except OSError as exc:
+        print(f"could not write {rc_path}: {exc}")
+        return False
+    return True
+
+
 def cmd_setup_mirror(argv: list[str]) -> int:
     p = argparse.ArgumentParser(
         prog="examine.py setup-mirror",
-        description="Install (or remove) a launchd user agent that mirrors the macOS "
-                    "iCloud HealthDrop container into a TCC-free directory. Required "
-                    "for consumers like OpenClaw / Codex CLI that cannot read the "
-                    "iCloud container directly.",
+        description="Install (or remove) a macOS background sync that mirrors the iCloud "
+                    "HealthDrop container into a TCC-free directory. Two install modes: "
+                    "launchd user agent (default; refreshes every N seconds but requires "
+                    "Full Disk Access on the python binary) or shell hook (--shell; "
+                    "refreshes on each new Terminal session, no extra TCC grant needed).",
     )
     p.add_argument("--uninstall", action="store_true",
-                   help="Stop the mirror agent and remove the plist (mirror dir is kept).")
+                   help="Remove whichever variant(s) are installed (launchd + shell hook). "
+                        "Mirror dir is kept so cached data is not lost.")
+    p.add_argument("--shell", action="store_true",
+                   help="Install the shell-hook variant instead of launchd. Appends a "
+                        "sentinel-delimited block to your shell rc (~/.zshrc by default) "
+                        "that fires `examine.py mirror --lock` in the background on each "
+                        "new interactive shell.")
+    p.add_argument("--shell-rc", default=None,
+                   help="Path to the shell rc file to manage (default ~/.zshrc). "
+                        "Only meaningful with --shell or --uninstall.")
     p.add_argument("--interval", type=int, default=MIRROR_DEFAULT_INTERVAL,
-                   help=f"Seconds between mirror ticks (default {MIRROR_DEFAULT_INTERVAL}).")
+                   help=f"Launchd-mode only: seconds between mirror ticks "
+                        f"(default {MIRROR_DEFAULT_INTERVAL}).")
     p.add_argument("--mirror-root", default="~/.healthdrop",
                    help="Where to mirror the iCloud container (default ~/.healthdrop).")
     p.add_argument("--source", default=None,
                    help="Override the source iCloud Documents directory.")
     args = p.parse_args(argv)
 
+    rc_path = os.path.expanduser(args.shell_rc) if args.shell_rc else _default_shell_rc()
+
     if args.uninstall:
-        return _uninstall_mirror_agent()
+        # Idempotent cleanup: try both variants regardless of which one (or
+        # both) the user originally installed. Each helper is a no-op if the
+        # corresponding artefact is absent.
+        plist_code = _uninstall_mirror_agent()
+        if _uninstall_shell_hook(rc_path):
+            print(f"removed shell hook block from {rc_path}")
+        else:
+            print(f"no shell hook block found in {rc_path}")
+        return plist_code
 
     source = args.source or _icloud_documents_dir()
+    if args.shell:
+        return _install_shell_hook(rc_path, args.mirror_root, source)
     return _install_mirror_agent(args.mirror_root, source, args.interval)
 
 

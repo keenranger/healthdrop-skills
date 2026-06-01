@@ -61,35 +61,60 @@ launched outside an interactive Terminal that has Full Disk Access — including
 the OpenClaw gateway, the Codex CLI, and most agent launchers — fail to read
 it with `Operation not permitted` even though the file is present.
 
-The skill ships with a built-in `setup-mirror` flow that installs a launchd
-user agent. The agent mirrors the iCloud container into `~/.healthdrop/` (a
-TCC-free path); the skill auto-prefers the mirror on read, so all queries keep
-working. One-time setup:
+The skill ships with a built-in `setup-mirror` flow that mirrors the iCloud
+container into `~/.healthdrop/` (a TCC-free path); the skill auto-prefers the
+mirror on read, so all queries keep working. Two install modes:
+
+### Mode B — shell hook (recommended; no extra permission)
+
+```bash
+python3 examine.py setup-mirror --shell
+```
+
+Appends a sentinel-delimited block to `~/.zshrc` that fires
+`examine.py mirror --lock --log` in the background on every new interactive
+shell. The mirror runs as a child of your Terminal, so it inherits the
+Terminal's existing Full Disk Access — **no extra TCC grant is needed**. The
+`--lock` flag (fcntl exclusive lock on `~/.healthdrop/.mirror.lock`) prevents
+concurrent shell opens from racing on the dest dir.
+
+Trade-off vs Mode A (launchd): the mirror only refreshes when you open a new
+shell, not on a fixed interval. Fine for most cases — open a terminal once a
+day and OpenClaw's queries get fresh data the rest of the day.
+
+Use `--shell-rc /path/to/rc` to manage a non-default rc file (e.g.
+`~/.bashrc`, `~/.config/fish/config.fish`).
+
+### Mode A — launchd user agent (refreshes every 120s; requires FDA)
 
 ```bash
 python3 examine.py setup-mirror
 ```
 
-The command prints the path of the `python3` binary that needs Full Disk
-Access plus the two `launchctl` lines (bootstrap + kickstart). The FDA grant
-is **required**, not optional: without it the launchd-spawned mirror can
-still copy locally-cached chunks, but iCloud refuses to materialise evicted
-day chunks for the agent (`Resource deadlock avoided` / `[Errno 11]` in the
-mirror log). Open **System Settings → Privacy & Security → Full Disk
-Access**, add the printed binary, then run the printed `launchctl` lines.
-From then on the agent fires every 120s, copies only changed files (manifest
-+ today's day chunk in steady state), and writes a one-line tick summary to
-`~/.healthdrop/mirror-log.txt`.
+Installs a launchd user agent that fires the mirror every 120s. The command
+prints the path of the `python3` binary that needs Full Disk Access plus the
+two `launchctl` lines (bootstrap + kickstart). The FDA grant is **required**,
+not optional: without it the launchd-spawned mirror can still copy
+locally-cached chunks, but iCloud refuses to materialise evicted day chunks
+for the agent (`Resource deadlock avoided` / `[Errno 11]` in the mirror log).
+Open **System Settings → Privacy & Security → Full Disk Access**, add the
+printed binary, then run the printed `launchctl` lines. From then on the
+agent copies only changed files (manifest + today's day chunk in steady
+state) and writes a one-line tick summary to `~/.healthdrop/mirror-log.txt`.
 
-To remove later:
+Mode A is for users who run OpenClaw continuously without ever opening a
+Terminal (24/7 background sync). The FDA grant is broader than most users
+need — Mode B is the recommended default.
+
+### Removal
 
 ```bash
 python3 examine.py setup-mirror --uninstall
 ```
 
-This stops the agent and removes the launchd plist. The mirror directory is
-intentionally kept so cached data is not lost — delete `~/.healthdrop/`
-manually if you no longer want it.
+Idempotent: removes whichever variant(s) are installed (launchd plist + shell
+hook block). The mirror directory is intentionally kept so cached data is not
+lost — delete `~/.healthdrop/` manually if you no longer want it.
 
 ### Escape hatches
 
