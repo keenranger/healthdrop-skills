@@ -70,12 +70,15 @@ working. One-time setup:
 python3 examine.py setup-mirror
 ```
 
-The command prints two `launchctl` lines (bootstrap + kickstart) and the
-absolute path of the `python3` binary that needs Full Disk Access. Open
-**System Settings → Privacy & Security → Full Disk Access**, enable that
-binary, then run the printed `launchctl kickstart` once. From then on the
-agent fires every 120s, copies only changed files (manifest + today's day
-chunk in steady state), and writes a one-line tick summary to
+The command prints the path of the `python3` binary that needs Full Disk
+Access plus the two `launchctl` lines (bootstrap + kickstart). The FDA grant
+is **required**, not optional: without it the launchd-spawned mirror can
+still copy locally-cached chunks, but iCloud refuses to materialise evicted
+day chunks for the agent (`Resource deadlock avoided` / `[Errno 11]` in the
+mirror log). Open **System Settings → Privacy & Security → Full Disk
+Access**, add the printed binary, then run the printed `launchctl` lines.
+From then on the agent fires every 120s, copies only changed files (manifest
++ today's day chunk in steady state), and writes a one-line tick summary to
 `~/.healthdrop/mirror-log.txt`.
 
 To remove later:

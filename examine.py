@@ -2456,17 +2456,29 @@ def _atomic_copy(src: str, dst: str) -> None:
     The mtime preservation is load-bearing: _needs_copy uses mtime to skip
     unchanged chunks, so a naive copy that resets mtime would force every
     chunk to re-copy on every mirror tick.
+
+    If any step raises, remove the half-written `.tmp` so the dest dir does
+    not accumulate orphan sidecars across failed ticks (common when iCloud
+    refuses to materialise an evicted file under the launchd-spawned
+    process's TCC context -- read() then fails with EDEADLK partway).
     """
     tmp = dst + ".tmp"
-    with open(src, "rb") as fh_src, open(tmp, "wb") as fh_dst:
-        while True:
-            buf = fh_src.read(65536)
-            if not buf:
-                break
-            fh_dst.write(buf)
-    s = os.stat(src)
-    os.utime(tmp, (s.st_atime, s.st_mtime))
-    os.replace(tmp, dst)
+    try:
+        with open(src, "rb") as fh_src, open(tmp, "wb") as fh_dst:
+            while True:
+                buf = fh_src.read(65536)
+                if not buf:
+                    break
+                fh_dst.write(buf)
+        s = os.stat(src)
+        os.utime(tmp, (s.st_atime, s.st_mtime))
+        os.replace(tmp, dst)
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def _do_mirror(source_dir: str, dest_root: str, log_enabled: bool) -> int:
@@ -2518,7 +2530,14 @@ def _do_mirror(source_dir: str, dest_root: str, log_enabled: bool) -> int:
                 except OSError as exc:
                     errors += 1
                     if log_enabled:
-                        _mirror_log(dest_root, f"chunk {name} copy failed: {exc}")
+                        # EDEADLK (errno 11) from an iCloud-container read means
+                        # the kernel's brc/iCloud coordination refused to fault
+                        # the file in for this process -- almost always because
+                        # the launchd-spawned python lacks Full Disk Access.
+                        hint = ""
+                        if getattr(exc, "errno", None) == 11:
+                            hint = "  [iCloud refused to materialise -- grant Full Disk Access to the python binary]"
+                        _mirror_log(dest_root, f"chunk {name} copy failed: {exc}{hint}")
             else:
                 chunks_skipped += 1
 
@@ -2594,19 +2613,23 @@ def _install_mirror_agent(mirror_root: str, source_dir: str, interval: int) -> i
     print(f"  mirror dir : {mirror_root}")
     print(f"  interval   : every {interval}s")
     print()
-    print("Next steps (run from any Terminal):")
+    print("Required next steps (run in this order):")
     print()
-    print(f"  launchctl bootstrap gui/{uid} {plist_path}")
-    print(f"  launchctl kickstart -k gui/{uid}/{MIRROR_LABEL}")
+    print("1. Grant Full Disk Access to the python binary above")
+    print("   (System Settings -> Privacy & Security -> Full Disk Access -> +)")
+    print(f"     {python_path}")
+    print("   Without this the launchd-spawned mirror cannot fault iCloud-")
+    print("   evicted day chunks (logs `Resource deadlock avoided`).")
     print()
-    print("If kickstart leaves the mirror empty, grant Full Disk Access to:")
-    print(f"  {python_path}")
-    print("via System Settings -> Privacy & Security -> Full Disk Access,")
-    print("then re-run the kickstart line above.")
+    print("2. Load the agent and trigger the first tick:")
     print()
-    print("Verify:")
-    print(f"  ls {mirror_root}")
-    print( "  python3 examine.py query list   # mirror is auto-preferred")
+    print(f"     launchctl bootstrap gui/{uid} {plist_path}")
+    print(f"     launchctl kickstart -k gui/{uid}/{MIRROR_LABEL}")
+    print()
+    print("3. Verify:")
+    print(f"     tail -1 {mirror_root}/mirror-log.txt   # expect errors=0")
+    print(f"     ls {mirror_root}/days | wc -l           # matches the source count")
+    print( "     python3 examine.py query list           # mirror is auto-preferred")
     print()
     print("To remove later:  python3 examine.py setup-mirror --uninstall")
     return 0
