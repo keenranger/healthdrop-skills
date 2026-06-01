@@ -2018,20 +2018,53 @@ def _build_index(db_path: str, data: dict, sig: str) -> None:
     os.replace(tmp, db_path)
 
 
+def _input_signature(path: str) -> Optional[str]:
+    """Compose a cache key from the manifest + days/ state.
+
+    Including the days/ dir mtime catches add/remove/rename of chunks (e.g.
+    a mirror tick that brings in new day files after a partial first run);
+    including the newest-chunk mtime catches in-place rewrites of today's
+    chunk (the only chunk HealthDrop's background observer mutates after
+    creation). Without these, a query against a v4 manifest+chunks layout
+    can return a stale SQLite index when the chunks evolve but the manifest
+    file itself doesn't.
+    """
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    parts = [f"manifest:{st.st_size}:{st.st_mtime_ns}"]
+    days_dir = os.path.join(os.path.dirname(os.path.abspath(path)), "days")
+    try:
+        days_st = os.stat(days_dir)
+    except OSError:
+        return "|".join(parts)
+    parts.append(f"days_dir:{days_st.st_mtime_ns}")
+    try:
+        entries = [n for n in os.listdir(days_dir) if n.endswith(".json")]
+    except OSError:
+        return "|".join(parts)
+    if entries:
+        # The lexicographically-largest YYYY-MM-DD.json is always the latest
+        # day -- which is the only chunk that mutates in place after creation.
+        latest = max(entries)
+        try:
+            latest_mtime_ns = os.stat(os.path.join(days_dir, latest)).st_mtime_ns
+            parts.append(f"latest_chunk:{latest}:{latest_mtime_ns}")
+        except OSError:
+            pass
+    return "|".join(parts)
+
+
 def ensure_query_index(path: str, as_json: bool) -> tuple[Optional[str], int]:
     """Return (db_path, 0) with a fresh index, or (None, code) on the file gate.
 
-    Fast path: when the index exists and the source's size+mtime signature is
-    unchanged, the JSON is never opened. Otherwise the source is parsed once
-    (reusing the report's file gate, so no_file=2 / parse_error=3 stay identical)
-    and the index is rebuilt.
+    Fast path: when the index exists and the source's composite signature is
+    unchanged (see _input_signature), the JSON is never opened. Otherwise the
+    source is parsed once (reusing the report's file gate, so no_file=2 /
+    parse_error=3 stay identical) and the index is rebuilt.
     """
-    sig: Optional[str] = None
-    try:
-        st = os.stat(path)
-        sig = f"{st.st_size}:{st.st_mtime_ns}"
-    except OSError:
-        sig = None
+    sig = _input_signature(path)
     db_path = _index_path_for(path)
     if sig is not None and os.path.exists(db_path):
         try:
@@ -2046,11 +2079,7 @@ def ensure_query_index(path: str, as_json: bool) -> tuple[Optional[str], int]:
     if data is None:
         return None, code
     if sig is None:
-        try:
-            st = os.stat(path)
-            sig = f"{st.st_size}:{st.st_mtime_ns}"
-        except OSError:
-            sig = "unknown"
+        sig = _input_signature(path) or "unknown"
     _build_index(db_path, data, sig)
     return db_path, 0
 
@@ -2457,6 +2486,13 @@ def _atomic_copy(src: str, dst: str) -> None:
     unchanged chunks, so a naive copy that resets mtime would force every
     chunk to re-copy on every mirror tick.
 
+    Uses fstat() on the open source handle (NOT os.stat(src)) so the dest
+    metadata describes the exact bytes that were copied. If iCloud
+    atomically replaces src after we opened it -- same size, newer mtime --
+    a path-based stat would stamp the dst with the new mtime even though
+    we read the old contents; future _needs_copy() ticks would then
+    perma-skip the dst and the mirror would silently rot.
+
     If any step raises, remove the half-written `.tmp` so the dest dir does
     not accumulate orphan sidecars across failed ticks (common when iCloud
     refuses to materialise an evicted file under the launchd-spawned
@@ -2470,7 +2506,7 @@ def _atomic_copy(src: str, dst: str) -> None:
                 if not buf:
                     break
                 fh_dst.write(buf)
-        s = os.stat(src)
+            s = os.fstat(fh_src.fileno())  # the file we actually read, not the path
         os.utime(tmp, (s.st_atime, s.st_mtime))
         os.replace(tmp, dst)
     except OSError:
@@ -2493,6 +2529,13 @@ def _do_mirror(source_dir: str, dest_root: str, log_enabled: bool) -> int:
     os.makedirs(dest_days, exist_ok=True)
 
     src_manifest = os.path.join(source_dir, "healthdrop.json")
+    if not os.path.exists(src_manifest):
+        # No manifest in iCloud yet (user has not exported, or sync still pending).
+        # Exit 0 with a short log line so the agent keeps polling without
+        # tripping launchd's ThrottleInterval / spamming repeated failure logs.
+        if log_enabled:
+            _mirror_log(dest_root, f"tick skipped: source manifest not found at {src_manifest}")
+        return 0
     dst_manifest = os.path.join(dest_root, "healthdrop.json")
 
     copied_manifest = False
@@ -2612,6 +2655,16 @@ def _install_mirror_agent(mirror_root: str, source_dir: str, interval: int) -> i
     print(f"  source dir : {source_dir}")
     print(f"  mirror dir : {mirror_root}")
     print(f"  interval   : every {interval}s")
+    if mirror_root != os.path.expanduser("~/.healthdrop"):
+        # resolve_input() only auto-prefers ~/.healthdrop/healthdrop.json. A
+        # custom mirror root is invisible to it, so default-path queries
+        # would still try the iCloud container and hit the same TCC wall.
+        # Tell the user how to wire the mirror back into the lookup.
+        print()
+        print("NOTE: non-default mirror dir. Auto-prefer logic only sees")
+        print(f"      ~/.healthdrop -- so set HEALTHDROP_EXPORT_PATH to make")
+        print(f"      readers find this mirror:")
+        print(f"        export HEALTHDROP_EXPORT_PATH={mirror_root}/healthdrop.json")
     print()
     print("Required next steps (run in this order):")
     print()
@@ -2639,16 +2692,22 @@ def _uninstall_mirror_agent() -> int:
     plist_path = _plist_path()
     uid = os.getuid()
 
-    boot = subprocess.run(
-        ["launchctl", "bootout", f"gui/{uid}/{MIRROR_LABEL}"],
-        capture_output=True, text=True,
-    )
-    if boot.returncode == 0:
-        print(f"launchctl bootout: ok ({MIRROR_LABEL})")
+    try:
+        boot = subprocess.run(
+            ["launchctl", "bootout", f"gui/{uid}/{MIRROR_LABEL}"],
+            capture_output=True, text=True,
+        )
+    except FileNotFoundError:
+        # launchctl is macOS-only. On other platforms (or pruned PATH) skip
+        # the bootout and just remove the plist if present.
+        print("launchctl not found; skipping bootout (macOS-only)")
     else:
-        # Common case: agent wasn't loaded. Surface the message but don't fail.
-        msg = (boot.stderr or boot.stdout or "").strip() or "not loaded"
-        print(f"launchctl bootout: {msg}")
+        if boot.returncode == 0:
+            print(f"launchctl bootout: ok ({MIRROR_LABEL})")
+        else:
+            # Common case: agent wasn't loaded. Surface the message but don't fail.
+            msg = (boot.stderr or boot.stdout or "").strip() or "not loaded"
+            print(f"launchctl bootout: {msg}")
 
     if os.path.exists(plist_path):
         try:

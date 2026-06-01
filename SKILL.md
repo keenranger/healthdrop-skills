@@ -124,19 +124,30 @@ is provisional or why a workout was ignored.
 When the question doesn't fit A or B — cross-metric, arbitrary grouping,
 sample-level pattern, or Python is unavailable:
 
-1. Read `healthdrop.json` (the manifest). Check `generatedAt`.
-2. Identify which UTC days are needed:
+1. **Pick the right root**, in this order:
+   - `$HEALTHDROP_EXPORT_PATH` if set — its parent directory is the root.
+   - `~/.healthdrop/` if it exists (the macOS mirror; see SKILL.md "macOS
+     setup" / README). Modes A and B auto-prefer this; direct reads must
+     opt in by reading from here instead of the iCloud container.
+   - Otherwise `~/Library/Mobile Documents/iCloud~dev~keenranger~healthdrop/Documents/`.
+2. Read `<root>/healthdrop.json` (the manifest). Check `generatedAt`.
+3. Identify which UTC days are needed:
    - "Last night?" → 1–2 chunks (may straddle UTC midnight)
    - "This month RHR?" → ~30 chunks
    - "Year of VO2max?" → ~365 chunks (cheap; sparse metric)
-3. Read each `days/YYYY-MM-DD.json` one at a time. Use the manifest's
+4. Read each `<root>/days/YYYY-MM-DD.json` one at a time. Use the manifest's
    `sampleCount` / `sizeBytes` per entry to estimate cost before deciding
    the window.
-4. Stream: accumulate stats per chunk, then drop it. Never hold every chunk
+5. Stream: accumulate stats per chunk, then drop it. Never hold every chunk
    in memory.
 
 **Always start by reading the manifest.** Never `ls days/` or read every
 chunk eagerly — that defeats the whole chunked design.
+
+Reading the iCloud path when the mirror exists is a bug: same TCC
+restriction that triggers `meta.status="permission_denied"` for Modes A/B
+will hit Mode C too. The mirror is the single point of truth on macOS
+once setup-mirror has been run.
 
 ### Local time vs UTC
 
