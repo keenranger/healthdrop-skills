@@ -53,6 +53,54 @@ Restart your OpenClaw agent so it picks up the new skill.
    trending?"
 3. The skill reads `healthdrop.json` (overwritten on every export) and grounds the answer.
 
+## macOS setup (TCC / mirror)
+
+`~/Library/Mobile Documents/iCloud~dev~keenranger~healthdrop/` is an iOS
+app's private iCloud container. macOS guards it with TCC, and processes
+launched outside an interactive Terminal that has Full Disk Access — including
+the OpenClaw gateway, the Codex CLI, and most agent launchers — fail to read
+it with `Operation not permitted` even though the file is present.
+
+The skill ships with a built-in `setup-mirror` flow that installs a launchd
+user agent. The agent mirrors the iCloud container into `~/.healthdrop/` (a
+TCC-free path); the skill auto-prefers the mirror on read, so all queries keep
+working. One-time setup:
+
+```bash
+python3 examine.py setup-mirror
+```
+
+The command prints two `launchctl` lines (bootstrap + kickstart) and the
+absolute path of the `python3` binary that needs Full Disk Access. Open
+**System Settings → Privacy & Security → Full Disk Access**, enable that
+binary, then run the printed `launchctl kickstart` once. From then on the
+agent fires every 120s, copies only changed files (manifest + today's day
+chunk in steady state), and writes a one-line tick summary to
+`~/.healthdrop/mirror-log.txt`.
+
+To remove later:
+
+```bash
+python3 examine.py setup-mirror --uninstall
+```
+
+This stops the agent and removes the launchd plist. The mirror directory is
+intentionally kept so cached data is not lost — delete `~/.healthdrop/`
+manually if you no longer want it.
+
+### Escape hatches
+
+- `HEALTHDROP_EXPORT_PATH=/some/readable/path/healthdrop.json` — point the
+  skill at any file. Wins over both the iCloud default and the mirror.
+- `python3 examine.py query list /explicit/path.json` — pass the path
+  positionally. Useful for ad-hoc testing.
+
+If you really want to read the iCloud container directly, the launchd plist
+that `setup-mirror` writes shows which Python binary needs Full Disk Access;
+granting FDA to the *interactive* Python (or to the OpenClaw / Codex launcher
+process itself) lets you skip the mirror. The mirror flow is recommended
+because it survives launcher upgrades without re-granting permissions.
+
 ## Customizing
 
 The bundle ID in the data path (`iCloud~dev~keenranger~healthdrop`) follows

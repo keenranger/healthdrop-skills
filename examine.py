@@ -40,16 +40,53 @@ import hashlib
 import json
 import math
 import os
+import plistlib
 import sqlite3
 import statistics
+import subprocess
 import sys
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Optional
 
 # Canonical iCloud Drive path the HealthDrop app overwrites on every export.
-DEFAULT_INPUT = (
+ICLOUD_INPUT = (
     "~/Library/Mobile Documents/iCloud~dev~keenranger~healthdrop/Documents/healthdrop.json"
 )
+# Local mirror landing zone (see `setup-mirror`). When this path exists and the
+# caller did not pass an explicit override, the skill reads from here instead
+# of iCloud -- the iCloud container is macOS-TCC-protected and not readable
+# from non-FDA processes such as OpenClaw / Codex CLI launchers.
+MIRROR_INPUT = "~/.healthdrop/healthdrop.json"
+# Environment override that wins over both defaults. Documented escape hatch
+# for users who want to point the skill at any path.
+ENV_INPUT_OVERRIDE = "HEALTHDROP_EXPORT_PATH"
+# Backwards-compatible alias: tests and the bundled HealthDrop app previously
+# referenced DEFAULT_INPUT. Keep the symbol pointing at the canonical iCloud
+# location so help text and any external references stay accurate.
+DEFAULT_INPUT = ICLOUD_INPUT
+
+
+def resolve_input(path: str) -> str:
+    """Pick the actual file to open from the user's (or default) input path.
+
+    Order of precedence:
+      1. ``HEALTHDROP_EXPORT_PATH`` env var (escape hatch -- always wins).
+      2. If the caller accepted the canonical iCloud default AND a local
+         mirror exists at MIRROR_INPUT, prefer the mirror. The iCloud
+         container is TCC-protected on macOS; the mirror sits under a normal
+         home-relative path that any user process can read. See the
+         ``setup-mirror`` subcommand for the launchd agent that maintains it.
+      3. Otherwise: return the path as given (after ``~`` expansion).
+    """
+    env_override = os.environ.get(ENV_INPUT_OVERRIDE)
+    if env_override:
+        return os.path.expanduser(env_override)
+    expanded = os.path.expanduser(path)
+    if expanded == os.path.expanduser(ICLOUD_INPUT):
+        mirror = os.path.expanduser(MIRROR_INPUT)
+        if os.path.exists(mirror):
+            return mirror
+    return expanded
 
 EXPECTED_SCHEMA_VERSION = 2
 
@@ -1293,6 +1330,10 @@ _FLAG_MESSAGES: dict[str, tuple[str, str]] = {
         "파일은 있지만 JSON으로 읽을 수 없어요.",
         "File present but not valid JSON.",
     ),
+    "permission_denied": (
+        "파일은 있지만 권한이 없어 읽지 못했어요 — macOS TCC 제한일 수 있어요. `setup-mirror` 또는 HEALTHDROP_EXPORT_PATH로 우회하세요.",
+        "File exists but is not readable -- likely a macOS TCC restriction. Use `setup-mirror` or set HEALTHDROP_EXPORT_PATH.",
+    ),
     "schema_mismatch": (
         "schemaVersion가 2가 아니에요 — 최선으로 파싱했지만 결과가 불완전할 수 있어요.",
         "schemaVersion is not 2 — parsed best-effort, results may be incomplete.",
@@ -1775,6 +1816,32 @@ def load_export_or_report(path: str, as_json: bool) -> tuple[Optional[dict], int
             print(msg["message_en"])
         # Diagnostics to stderr; data-absence is reported in the output too.
         print(f"error: file not found: {path}", file=sys.stderr)
+        return None, 2
+    except PermissionError:
+        # macOS TCC blocks reads of `~/Library/Mobile Documents/iCloud~*` from
+        # processes that lack Full Disk Access, which is the common case for
+        # OpenClaw / Codex CLI / any non-Terminal launcher. Print actionable
+        # guidance so the user knows what to fix rather than just an errno.
+        msg = _flag("permission_denied", "caution")
+        if as_json:
+            print(json.dumps({"schema": "healthdrop.digest/1", "meta": {"status": "permission_denied"}, "flags": [msg]}, ensure_ascii=False))
+        else:
+            print("HealthDrop export exists but this process cannot read it:")
+            print(f"  {path}")
+            if "Mobile Documents" in path:
+                print()
+                print("This is a macOS TCC restriction: iCloud app-private containers")
+                print("are not readable from processes outside a Terminal with Full")
+                print("Disk Access. Two fixes:")
+                print()
+                print("  A. One-time mirror (recommended -- bypasses TCC for any consumer):")
+                print("       python3 examine.py setup-mirror")
+                print("     then follow the printed launchctl + Full Disk Access steps.")
+                print("     The skill will auto-prefer the mirror on subsequent runs.")
+                print()
+                print(f"  B. Point the skill at a readable path via env var:")
+                print(f"       export {ENV_INPUT_OVERRIDE}=/path/to/healthdrop.json")
+        print(f"error: permission denied: {path}", file=sys.stderr)
         return None, 2
     except OSError as exc:
         print(f"error: cannot read file: {exc}", file=sys.stderr)
@@ -2314,7 +2381,7 @@ def cmd_query(argv: list[str]) -> int:
     _common(pd)
 
     args = p.parse_args(argv)
-    db_path, code = ensure_query_index(os.path.expanduser(args.input_opt or args.input), args.json)
+    db_path, code = ensure_query_index(resolve_input(args.input_opt or args.input), args.json)
     if db_path is None:
         return code
     con = sqlite3.connect(db_path)
@@ -2330,10 +2397,285 @@ def cmd_query(argv: list[str]) -> int:
     return 2
 
 
+# --------------------------------------------------------------------------- #
+# Mirror mode  (examine.py setup-mirror / examine.py mirror)
+#
+# macOS guards `~/Library/Mobile Documents/iCloud~*` containers with TCC: only
+# processes that the user has granted Full Disk Access can read them. OpenClaw,
+# Codex CLI, and other agent launchers usually fail that check, so the iCloud
+# export is unreadable even though it is sitting right there.
+#
+# The mirror pattern works around this: a small launchd user agent, owned by
+# the user's interactive Terminal context (which CAN be granted FDA in a single
+# system-settings click), copies the iCloud container into a plain home-relative
+# directory (`~/.healthdrop/`). The mirror is identical in shape -- manifest +
+# `days/YYYY-MM-DD.json` chunks -- so the rest of the skill keeps working
+# unchanged. resolve_input() auto-prefers the mirror when it exists.
+#
+# Why launchd over a cron / login script: cron is restricted under SIP and
+# launchd is the macOS-native way to run periodic user-space tasks. Why poll
+# vs WatchPaths: iCloud's atomic-write dance does not always trigger WatchPaths
+# cleanly, and the export rate (a few times per hour at most) does not justify
+# the complexity. Poll every 120s by default.
+# --------------------------------------------------------------------------- #
+MIRROR_LABEL = "dev.keenranger.healthdrop.mirror"
+MIRROR_DEFAULT_INTERVAL = 120  # seconds between mirror runs
+
+
+def _icloud_documents_dir() -> str:
+    """Source directory the mirror reads from -- iCloud container Documents/."""
+    return os.path.dirname(os.path.expanduser(ICLOUD_INPUT))
+
+
+def _mirror_log(dest_root: str, message: str) -> None:
+    """Append a timestamped line to the mirror's own log. Best-effort."""
+    log_path = os.path.join(dest_root, "mirror-log.txt")
+    try:
+        ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        with open(log_path, "a", encoding="utf-8") as fh:
+            fh.write(f"{ts} {message}\n")
+    except OSError:
+        pass  # logging is best-effort; never block the mirror
+
+
+def _needs_copy(src: str, dst: str) -> bool:
+    """True iff dst is missing or differs from src in size or mtime."""
+    if not os.path.exists(dst):
+        return True
+    try:
+        s_src = os.stat(src)
+        s_dst = os.stat(dst)
+    except OSError:
+        return True
+    return s_src.st_size != s_dst.st_size or int(s_src.st_mtime) != int(s_dst.st_mtime)
+
+
+def _atomic_copy(src: str, dst: str) -> None:
+    """Copy src to dst via a `.tmp` sidecar + rename, preserving mtime.
+
+    The mtime preservation is load-bearing: _needs_copy uses mtime to skip
+    unchanged chunks, so a naive copy that resets mtime would force every
+    chunk to re-copy on every mirror tick.
+    """
+    tmp = dst + ".tmp"
+    with open(src, "rb") as fh_src, open(tmp, "wb") as fh_dst:
+        while True:
+            buf = fh_src.read(65536)
+            if not buf:
+                break
+            fh_dst.write(buf)
+    s = os.stat(src)
+    os.utime(tmp, (s.st_atime, s.st_mtime))
+    os.replace(tmp, dst)
+
+
+def _do_mirror(source_dir: str, dest_root: str, log_enabled: bool) -> int:
+    """Sync manifest + days/ from source_dir into dest_root. Returns exit code.
+
+    0 = ok (incl. nothing to do). 5 = at least one copy failed (most likely a
+    macOS TCC denial -- the launchd-spawned python needs Full Disk Access).
+    """
+    source_dir = os.path.expanduser(source_dir)
+    dest_root = os.path.expanduser(dest_root)
+    dest_days = os.path.join(dest_root, "days")
+    os.makedirs(dest_days, exist_ok=True)
+
+    src_manifest = os.path.join(source_dir, "healthdrop.json")
+    dst_manifest = os.path.join(dest_root, "healthdrop.json")
+
+    copied_manifest = False
+    chunks_copied = 0
+    chunks_skipped = 0
+    errors = 0
+
+    if _needs_copy(src_manifest, dst_manifest):
+        try:
+            _atomic_copy(src_manifest, dst_manifest)
+            copied_manifest = True
+        except OSError as exc:
+            errors += 1
+            if log_enabled:
+                _mirror_log(dest_root, f"manifest copy failed: {exc}")
+
+    src_days = os.path.join(source_dir, "days")
+    if os.path.isdir(src_days):
+        try:
+            entries = sorted(os.listdir(src_days))
+        except OSError as exc:
+            errors += 1
+            if log_enabled:
+                _mirror_log(dest_root, f"days/ listdir failed: {exc}")
+            entries = []
+        for name in entries:
+            if not name.endswith(".json"):
+                continue
+            src = os.path.join(src_days, name)
+            dst = os.path.join(dest_days, name)
+            if _needs_copy(src, dst):
+                try:
+                    _atomic_copy(src, dst)
+                    chunks_copied += 1
+                except OSError as exc:
+                    errors += 1
+                    if log_enabled:
+                        _mirror_log(dest_root, f"chunk {name} copy failed: {exc}")
+            else:
+                chunks_skipped += 1
+
+    if log_enabled:
+        _mirror_log(
+            dest_root,
+            f"tick manifest={int(copied_manifest)} copied={chunks_copied} "
+            f"skipped={chunks_skipped} errors={errors}",
+        )
+    return 0 if errors == 0 else 5
+
+
+def cmd_mirror(argv: list[str]) -> int:
+    """Run one mirror tick. Designed to be invoked by launchd, not interactively."""
+    p = argparse.ArgumentParser(
+        prog="examine.py mirror",
+        description="Copy the iCloud HealthDrop container into a TCC-free mirror dir. "
+                    "Intended to be called by the launchd agent installed via setup-mirror.",
+    )
+    p.add_argument("--source", default=None,
+                   help="Source iCloud Documents directory (default: canonical container).")
+    p.add_argument("--dest", default="~/.healthdrop",
+                   help="Destination mirror directory (default: ~/.healthdrop).")
+    p.add_argument("--log", action="store_true",
+                   help="Append a one-line tick summary to {dest}/mirror-log.txt.")
+    args = p.parse_args(argv)
+
+    source = args.source or _icloud_documents_dir()
+    return _do_mirror(source, args.dest, args.log)
+
+
+def _plist_path() -> str:
+    return os.path.expanduser(f"~/Library/LaunchAgents/{MIRROR_LABEL}.plist")
+
+
+def _install_mirror_agent(mirror_root: str, source_dir: str, interval: int) -> int:
+    mirror_root = os.path.expanduser(mirror_root)
+    source_dir = os.path.expanduser(source_dir)
+    os.makedirs(os.path.join(mirror_root, "days"), exist_ok=True)
+
+    plist_path = _plist_path()
+    os.makedirs(os.path.dirname(plist_path), exist_ok=True)
+
+    examine_path = os.path.abspath(__file__)
+    python_path = sys.executable
+
+    plist: dict[str, Any] = {
+        "Label": MIRROR_LABEL,
+        "ProgramArguments": [
+            python_path,
+            examine_path,
+            "mirror",
+            "--source", source_dir,
+            "--dest", mirror_root,
+            "--log",
+        ],
+        "RunAtLoad": True,
+        "StartInterval": interval,
+        "StandardOutPath": os.path.join(mirror_root, "mirror-launchd.log"),
+        "StandardErrorPath": os.path.join(mirror_root, "mirror-launchd.err"),
+        "ProcessType": "Background",
+        "Nice": 10,
+    }
+    with open(plist_path, "wb") as fh:
+        plistlib.dump(plist, fh)
+
+    uid = os.getuid()
+    print("setup-mirror: installed.")
+    print(f"  label      : {MIRROR_LABEL}")
+    print(f"  plist      : {plist_path}")
+    print(f"  python     : {python_path}")
+    print(f"  source dir : {source_dir}")
+    print(f"  mirror dir : {mirror_root}")
+    print(f"  interval   : every {interval}s")
+    print()
+    print("Next steps (run from any Terminal):")
+    print()
+    print(f"  launchctl bootstrap gui/{uid} {plist_path}")
+    print(f"  launchctl kickstart -k gui/{uid}/{MIRROR_LABEL}")
+    print()
+    print("If kickstart leaves the mirror empty, grant Full Disk Access to:")
+    print(f"  {python_path}")
+    print("via System Settings -> Privacy & Security -> Full Disk Access,")
+    print("then re-run the kickstart line above.")
+    print()
+    print("Verify:")
+    print(f"  ls {mirror_root}")
+    print( "  python3 examine.py query list   # mirror is auto-preferred")
+    print()
+    print("To remove later:  python3 examine.py setup-mirror --uninstall")
+    return 0
+
+
+def _uninstall_mirror_agent() -> int:
+    plist_path = _plist_path()
+    uid = os.getuid()
+
+    boot = subprocess.run(
+        ["launchctl", "bootout", f"gui/{uid}/{MIRROR_LABEL}"],
+        capture_output=True, text=True,
+    )
+    if boot.returncode == 0:
+        print(f"launchctl bootout: ok ({MIRROR_LABEL})")
+    else:
+        # Common case: agent wasn't loaded. Surface the message but don't fail.
+        msg = (boot.stderr or boot.stdout or "").strip() or "not loaded"
+        print(f"launchctl bootout: {msg}")
+
+    if os.path.exists(plist_path):
+        try:
+            os.remove(plist_path)
+            print(f"removed: {plist_path}")
+        except OSError as exc:
+            print(f"could not remove {plist_path}: {exc}")
+            return 1
+    else:
+        print(f"plist not present: {plist_path}")
+
+    print()
+    print("The mirror directory (~/.healthdrop/) is intentionally kept so cached")
+    print("data is not lost. Delete it manually if you no longer want the mirror.")
+    return 0
+
+
+def cmd_setup_mirror(argv: list[str]) -> int:
+    p = argparse.ArgumentParser(
+        prog="examine.py setup-mirror",
+        description="Install (or remove) a launchd user agent that mirrors the macOS "
+                    "iCloud HealthDrop container into a TCC-free directory. Required "
+                    "for consumers like OpenClaw / Codex CLI that cannot read the "
+                    "iCloud container directly.",
+    )
+    p.add_argument("--uninstall", action="store_true",
+                   help="Stop the mirror agent and remove the plist (mirror dir is kept).")
+    p.add_argument("--interval", type=int, default=MIRROR_DEFAULT_INTERVAL,
+                   help=f"Seconds between mirror ticks (default {MIRROR_DEFAULT_INTERVAL}).")
+    p.add_argument("--mirror-root", default="~/.healthdrop",
+                   help="Where to mirror the iCloud container (default ~/.healthdrop).")
+    p.add_argument("--source", default=None,
+                   help="Override the source iCloud Documents directory.")
+    args = p.parse_args(argv)
+
+    if args.uninstall:
+        return _uninstall_mirror_agent()
+
+    source = args.source or _icloud_documents_dir()
+    return _install_mirror_agent(args.mirror_root, source, args.interval)
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     raw_argv = sys.argv[1:] if argv is None else argv
     if raw_argv and raw_argv[0] == "query":
         return cmd_query(raw_argv[1:])
+    if raw_argv and raw_argv[0] == "setup-mirror":
+        return cmd_setup_mirror(raw_argv[1:])
+    if raw_argv and raw_argv[0] == "mirror":
+        return cmd_mirror(raw_argv[1:])
 
     parser = argparse.ArgumentParser(
         description="Examine the user's HealthDrop iCloud export and print a privacy-safe health digest.",
@@ -2350,7 +2692,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--lang", choices=["ko", "en"], default=None, help="Render-language hint (JSON carries both).")
     args = parser.parse_args(raw_argv)
 
-    path = os.path.expanduser(args.input_opt or args.input)
+    path = resolve_input(args.input_opt or args.input)
     data, code = load_export_or_report(path, args.json)
     if data is None:
         return code

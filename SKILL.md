@@ -95,11 +95,19 @@ Check the status header first:
 - `meta.status = "no_file"` ("export not found") → iCloud hasn't synced or no
   export has run. Tell the user to run an export and retry.
 - `meta.status = "parse_error"` → unreadable file; say so. Don't paste it.
+- `meta.status = "permission_denied"` → macOS TCC blocks the iCloud container
+  from this launcher (OpenClaw / Codex CLI / etc.). Tell the user to run
+  `python3 examine.py setup-mirror` once and follow the printed launchctl +
+  Full Disk Access steps; the skill auto-prefers the resulting
+  `~/.healthdrop/` mirror on subsequent runs. Or, point the skill at any
+  readable file via `HEALTHDROP_EXPORT_PATH=/path/to/healthdrop.json`.
 - Otherwise proceed.
 
 Flags:
 
 - `--input PATH` overrides the iCloud path.
+- `HEALTHDROP_EXPORT_PATH` env var overrides the iCloud path (wins over both
+  the default and the local mirror). Useful for one-off testing.
 - `--json` emits `DigestReport` (`schema: "healthdrop.digest/1"`) with
   numbers, band tokens (`green`/`amber`/`red`), and bilingual flag messages
   (`message_ko`/`message_en`).
