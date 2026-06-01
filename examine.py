@@ -1836,7 +1836,11 @@ def load_export_or_report(path: str, as_json: bool) -> tuple[Optional[dict], int
             print("HealthDrop export exists but this process cannot read it:")
             print(f"  {path}")
             if "Mobile Documents" in path:
-                examine_abs = os.path.abspath(__file__)
+                # Quote in case the skill is installed under a path with
+                # spaces (e.g. ~/Library/Application Support/...). Without
+                # quoting, the copy-pasted hint splits on whitespace and
+                # python complains "can't open file".
+                examine_abs = _shell_quote(os.path.abspath(__file__))
                 print()
                 print("This is a macOS TCC restriction: iCloud app-private containers")
                 print("are not readable from processes outside a Terminal with Full")
@@ -3327,13 +3331,18 @@ def _install_shell_hook(rc_path: str, mirror_root: str, source_dir: str) -> int:
         existing_mode = os.stat(rc_path).st_mode & 0o777
     except OSError:
         existing_mode = 0o600
+    # Resolve symlinks before writing: many users keep ~/.zshrc as a symlink
+    # into a dotfiles checkout. os.replace(tmp, link) replaces the SYMLINK
+    # with a regular file, silently breaking the dotfiles mapping. Write to
+    # the realpath instead so the managed target is what gets updated.
+    target_path = os.path.realpath(rc_path)
     try:
-        os.makedirs(os.path.dirname(rc_path) or ".", exist_ok=True)
-        tmp = rc_path + ".tmp.healthdrop"
+        os.makedirs(os.path.dirname(target_path) or ".", exist_ok=True)
+        tmp = target_path + ".tmp.healthdrop"
         with open(tmp, "w", encoding="utf-8") as fh:
             fh.write(new_content)
         os.chmod(tmp, existing_mode)
-        os.replace(tmp, rc_path)
+        os.replace(tmp, target_path)
     except OSError as exc:
         print(f"could not write {rc_path}: {exc}")
         return 1
@@ -3426,12 +3435,16 @@ def _uninstall_shell_hook(rc_path: str) -> bool:
         existing_mode = os.stat(rc_path).st_mode & 0o777
     except OSError:
         existing_mode = 0o600
-    tmp = rc_path + ".tmp.healthdrop"
+    # Same dotfiles-symlink concern as _install_shell_hook: write to the
+    # realpath so we update the managed target rather than replacing the
+    # symlink with a regular file.
+    target_path = os.path.realpath(rc_path)
+    tmp = target_path + ".tmp.healthdrop"
     try:
         with open(tmp, "w", encoding="utf-8") as fh:
             fh.write(cleaned)
         os.chmod(tmp, existing_mode)  # preserve rc perms; never demote 0o600 to 0o644
-        os.replace(tmp, rc_path)
+        os.replace(tmp, target_path)
     except OSError:
         # Re-raise so cmd_setup_mirror --uninstall can distinguish a real
         # write failure from "no block found" and return non-zero. Returning
@@ -3474,7 +3487,15 @@ def cmd_setup_mirror(argv: list[str]) -> int:
                    help="Override the source iCloud Documents directory.")
     args = p.parse_args(argv)
 
-    rc_path = os.path.expanduser(args.shell_rc) if args.shell_rc else _default_shell_rc()
+    # abspath() the custom --shell-rc the same way mirror_root/source are
+    # normalised. A relative `--shell-rc rc` installed from one cwd would
+    # otherwise have a printed uninstall hint that, when run from a
+    # different cwd, edits a different file (or reports no hook found)
+    # and leaves the original hook firing forever.
+    rc_path = (
+        os.path.abspath(os.path.expanduser(args.shell_rc))
+        if args.shell_rc else _default_shell_rc()
+    )
 
     if args.uninstall:
         # Idempotent cleanup: try both variants regardless of which one (or
