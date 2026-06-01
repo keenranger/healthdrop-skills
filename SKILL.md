@@ -96,11 +96,15 @@ Check the status header first:
   export has run. Tell the user to run an export and retry.
 - `meta.status = "parse_error"` → unreadable file; say so. Don't paste it.
 - `meta.status = "permission_denied"` → macOS TCC blocks the iCloud container
-  from this launcher (OpenClaw / Codex CLI / etc.). Tell the user to run
-  `python3 examine.py setup-mirror` once and follow the printed launchctl +
-  Full Disk Access steps; the skill auto-prefers the resulting
-  `~/.healthdrop/` mirror on subsequent runs. Or, point the skill at any
-  readable file via `HEALTHDROP_EXPORT_PATH=/path/to/healthdrop.json`.
+  from this launcher (OpenClaw / Codex CLI / etc.). Tell the user the
+  recommended fix: run `python3 examine.py setup-mirror --shell` once. That
+  installs a one-line hook in `~/.zshrc` that mirrors the iCloud container
+  to `~/.healthdrop/` on every new Terminal — no Full Disk Access grant
+  needed because the mirror inherits the Terminal's TCC context. The skill
+  auto-prefers `~/.healthdrop/` on subsequent runs. (Alternatives: run
+  `setup-mirror` without `--shell` for a launchd-driven 120s-interval
+  refresh, which requires a Full Disk Access grant; or point the skill at
+  any readable path via `HEALTHDROP_EXPORT_PATH=/path/to/healthdrop.json`.)
 - Otherwise proceed.
 
 Flags:
