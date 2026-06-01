@@ -66,23 +66,30 @@ ENV_INPUT_OVERRIDE = "HEALTHDROP_EXPORT_PATH"
 DEFAULT_INPUT = ICLOUD_INPUT
 
 
-def resolve_input(path: str) -> str:
+def resolve_input(path: str, *, defaulted: bool = True) -> str:
     """Pick the actual file to open from the user's (or default) input path.
 
     Order of precedence:
       1. ``HEALTHDROP_EXPORT_PATH`` env var (escape hatch -- always wins).
-      2. If the caller accepted the canonical iCloud default AND a local
-         mirror exists at MIRROR_INPUT, prefer the mirror. The iCloud
-         container is TCC-protected on macOS; the mirror sits under a normal
-         home-relative path that any user process can read. See the
-         ``setup-mirror`` subcommand for the launchd agent that maintains it.
+      2. If the caller accepted the parser default AND a local mirror exists
+         at MIRROR_INPUT, prefer the mirror. The iCloud container is
+         TCC-protected on macOS; the mirror sits under a normal home-relative
+         path that any user process can read. See the ``setup-mirror``
+         subcommand for the agent / shell hook that maintains it.
       3. Otherwise: return the path as given (after ``~`` expansion).
+
+    ``defaulted`` is the load-bearing distinction between "the parser
+    silently filled in the iCloud path because the user passed nothing"
+    (mirror auto-prefer applies) and "the user explicitly typed the
+    canonical iCloud path because they want THAT file" (mirror is bypassed
+    -- common after the user grants Full Disk Access and wants to confirm
+    the source is fresher than a stale mirror).
     """
     env_override = os.environ.get(ENV_INPUT_OVERRIDE)
     if env_override:
         return os.path.expanduser(env_override)
     expanded = os.path.expanduser(path)
-    if expanded == os.path.expanduser(ICLOUD_INPUT):
+    if defaulted:
         mirror = os.path.expanduser(MIRROR_INPUT)
         if os.path.exists(mirror):
             return mirror
@@ -2389,7 +2396,13 @@ def cmd_query(argv: list[str]) -> int:
     sub = p.add_subparsers(dest="qcmd", required=True)
 
     def _common(sp: argparse.ArgumentParser) -> None:
-        sp.add_argument("input", nargs="?", default=DEFAULT_INPUT, help="Path to healthdrop.json.")
+        # default=None (not DEFAULT_INPUT) so resolve_input() can tell the user
+        # "I omitted the path, fill in the canonical iCloud default and apply
+        # mirror auto-prefer" from "I explicitly typed the canonical iCloud
+        # path, bypass the mirror." Help text still advertises the canonical
+        # path so the UX is unchanged.
+        sp.add_argument("input", nargs="?", default=None,
+                        help=f"Path to healthdrop.json (default: {DEFAULT_INPUT}).")
         sp.add_argument("--input", dest="input_opt", default=None, help="Alternative way to pass the path.")
         sp.add_argument("--json", action="store_true", help="Machine-readable output.")
 
@@ -2413,7 +2426,9 @@ def cmd_query(argv: list[str]) -> int:
     _common(pd)
 
     args = p.parse_args(argv)
-    db_path, code = ensure_query_index(resolve_input(args.input_opt or args.input), args.json)
+    user_path = args.input_opt or args.input
+    resolved = resolve_input(user_path or DEFAULT_INPUT, defaulted=user_path is None)
+    db_path, code = ensure_query_index(resolved, args.json)
     if db_path is None:
         return code
     con = sqlite3.connect(db_path)
@@ -2541,13 +2556,24 @@ def _do_mirror(source_dir: str, dest_root: str, log_enabled: bool) -> int:
     os.makedirs(dest_days, exist_ok=True)
 
     src_manifest = os.path.join(source_dir, "healthdrop.json")
-    if not os.path.exists(src_manifest):
-        # No manifest in iCloud yet (user has not exported, or sync still pending).
-        # Exit 0 with a short log line so the agent keeps polling without
-        # tripping launchd's ThrottleInterval / spamming repeated failure logs.
+    try:
+        os.stat(src_manifest)
+    except FileNotFoundError:
+        # No manifest in iCloud yet (user has not exported, or sync still
+        # pending). Exit 0 with a short log line so the agent keeps polling
+        # without tripping launchd's ThrottleInterval or spamming repeats.
         if log_enabled:
             _mirror_log(dest_root, f"tick skipped: source manifest not found at {src_manifest}")
         return 0
+    except OSError as exc:
+        # Stat failed for a non-FileNotFound reason: most often TCC denial
+        # on the launchd-spawned mirror, sometimes EIO from iCloud
+        # coordination. Treat as a real failure -- the user's verification
+        # step is "tail mirror-log.txt and expect errors=0", and a silent
+        # exit 0 here would make a TCC setup mistake look like success.
+        if log_enabled:
+            _mirror_log(dest_root, f"manifest stat failed: {exc}")
+        return 5
     dst_manifest = os.path.join(dest_root, "healthdrop.json")
 
     copied_manifest = False
@@ -2632,7 +2658,12 @@ def cmd_mirror(argv: list[str]) -> int:
     args = p.parse_args(argv)
 
     source = args.source or _icloud_documents_dir()
-    dest_root = os.path.expanduser(args.dest)
+    # Normalize to abspath: when launchd / a shell hook calls us with a
+    # relative --dest, the runtime cwd may differ from where the user
+    # configured the mirror, and a relative path would silently land
+    # elsewhere.
+    dest_root = os.path.abspath(os.path.expanduser(args.dest))
+    args.dest = dest_root
 
     if args.lock:
         import fcntl
@@ -2657,8 +2688,12 @@ def _plist_path() -> str:
 
 
 def _install_mirror_agent(mirror_root: str, source_dir: str, interval: int) -> int:
-    mirror_root = os.path.expanduser(mirror_root)
-    source_dir = os.path.expanduser(source_dir)
+    # abspath() after expanduser(): launchd spawns the mirror with cwd=/ , so
+    # any relative path baked into the plist would resolve against / and
+    # either fail or silently mirror to the wrong place. Same for the
+    # HEALTHDROP_EXPORT_PATH hint that resolve_input() reads.
+    mirror_root = os.path.abspath(os.path.expanduser(mirror_root))
+    source_dir = os.path.abspath(os.path.expanduser(source_dir))
     os.makedirs(os.path.join(mirror_root, "days"), exist_ok=True)
 
     plist_path = _plist_path()
@@ -2828,8 +2863,11 @@ def _strip_hook_block(content: str) -> str:
 
 
 def _install_shell_hook(rc_path: str, mirror_root: str, source_dir: str) -> int:
-    mirror_root = os.path.expanduser(mirror_root)
-    source_dir = os.path.expanduser(source_dir)
+    # abspath() after expanduser() so the snippet records a stable absolute
+    # path; the rc file is sourced from arbitrary cwds across new shells and
+    # a relative path would silently rebind the mirror per session.
+    mirror_root = os.path.abspath(os.path.expanduser(mirror_root))
+    source_dir = os.path.abspath(os.path.expanduser(source_dir))
     os.makedirs(os.path.join(mirror_root, "days"), exist_ok=True)
 
     examine_path = os.path.abspath(__file__)
@@ -2975,7 +3013,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument(
         "input",
         nargs="?",
-        default=DEFAULT_INPUT,
+        default=None,  # sentinel; see resolve_input() docstring for why
         help="Path to healthdrop.json (default: canonical iCloud path).",
     )
     parser.add_argument("--input", dest="input_opt", default=None, help="Alternative way to pass the input path.")
@@ -2983,7 +3021,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--lang", choices=["ko", "en"], default=None, help="Render-language hint (JSON carries both).")
     args = parser.parse_args(raw_argv)
 
-    path = resolve_input(args.input_opt or args.input)
+    user_path = args.input_opt or args.input
+    path = resolve_input(user_path or DEFAULT_INPUT, defaulted=user_path is None)
     data, code = load_export_or_report(path, args.json)
     if data is None:
         return code
