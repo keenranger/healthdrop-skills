@@ -79,10 +79,6 @@ def resolve_default_input() -> str:
     return ICLOUD_INPUT
 
 
-# Resolved once at import (mirror-first); the CLI --input / positional arg still
-# override it. See resolve_default_input for the full precedence.
-DEFAULT_INPUT = resolve_default_input()
-
 EXPECTED_SCHEMA_VERSION = 4
 
 # Full expected metric catalog (key -> expected unit), mirroring QUANTITY_METRICS
@@ -2322,7 +2318,7 @@ def cmd_query(argv: list[str]) -> int:
     sub = p.add_subparsers(dest="qcmd", required=True)
 
     def _common(sp: argparse.ArgumentParser) -> None:
-        sp.add_argument("input", nargs="?", default=DEFAULT_INPUT, help="Path to healthdrop.json.")
+        sp.add_argument("input", nargs="?", default=None, help="Path to healthdrop.json.")
         sp.add_argument("--input", dest="input_opt", default=None, help="Alternative way to pass the path.")
         sp.add_argument("--json", action="store_true", help="Machine-readable output.")
 
@@ -2346,7 +2342,11 @@ def cmd_query(argv: list[str]) -> int:
     _common(pd)
 
     args = p.parse_args(argv)
-    db_path, code = ensure_query_index(os.path.expanduser(args.input_opt or args.input), args.json)
+    # Default resolved here, not at import: keeps $HEALTHDROP_EXPORT_PATH and
+    # the mirror-existence check evaluated at invocation time.
+    db_path, code = ensure_query_index(
+        os.path.expanduser(args.input_opt or args.input or resolve_default_input()), args.json
+    )
     if db_path is None:
         return code
     con = sqlite3.connect(db_path)
@@ -2374,15 +2374,16 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument(
         "input",
         nargs="?",
-        default=DEFAULT_INPUT,
-        help="Path to healthdrop.json (default: ~/.healthdrop/ helper mirror, else the iCloud container).",
+        default=None,
+        help="Path to healthdrop.json (default: $HEALTHDROP_EXPORT_PATH, else the "
+        "~/.healthdrop/ helper mirror, else the iCloud container).",
     )
     parser.add_argument("--input", dest="input_opt", default=None, help="Alternative way to pass the input path.")
     parser.add_argument("--json", action="store_true", help="Emit the machine-readable DigestReport JSON.")
     parser.add_argument("--lang", choices=["ko", "en"], default=None, help="Render-language hint (JSON carries both).")
     args = parser.parse_args(raw_argv)
 
-    path = os.path.expanduser(args.input_opt or args.input)
+    path = os.path.expanduser(args.input_opt or args.input or resolve_default_input())
     data, code = load_export_or_report(path, args.json)
     if data is None:
         return code
