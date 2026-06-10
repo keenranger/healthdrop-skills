@@ -1,6 +1,13 @@
 ---
 name: healthdrop
 description: Answer questions about the user's iPhone HealthKit data — sleep, HRV, resting heart rate, steps, workouts, and ~25 other quantity types — from their HealthDrop iCloud export. Three modes: `examine.py query` for one metric / one day / a trend (SQLite-indexed, hundreds of tokens), `examine.py` for a full multi-domain checkup with thresholds, direct manifest + day-chunk reads for ad-hoc / cross-metric questions or when Python is unavailable. Triggers on Korean and English health keywords like 수면 / sleep, HRV, 심박, 걸음 / steps, 운동 / workout, 회복 / recovery, 컨디션, 헬스 / health, 건강 검진, 종합 분석.
+
+install:
+  - kind: brew
+    cask: true
+    formula: keenranger/tap/healthdrop-helper
+    label: HealthDrop Helper (macOS background sync)
+    os: macos
 ---
 
 # HealthDrop skill
@@ -12,8 +19,12 @@ across whatever history they have, not just the last week.
 
 ## Data location
 
+This skill reads the **macOS helper mirror** at `~/.healthdrop/` — a
+TCC-free copy the HealthDrop helper re-exports from the iCloud container
+so claws can read it without a Full Disk Access grant:
+
 ```
-~/Library/Mobile Documents/iCloud~dev~keenranger~healthdrop/Documents/
+~/.healthdrop/
 ├── healthdrop.json          ← manifest (a few KB)
 └── days/
     ├── 2024-01-15.json      ← one chunk per UTC day
@@ -21,9 +32,20 @@ across whatever history they have, not just the last week.
     └── ...
 ```
 
-If `healthdrop.json` does not exist, iCloud has not synced yet. Wait a
-minute or ask the user to open the HealthDrop app on iPhone (the first
-export bootstraps the manifest).
+`examine.py` resolves the path mirror-first: `$HEALTHDROP_EXPORT_PATH`
+if set, then `~/.healthdrop/healthdrop.json` (the mirror), then the
+legacy iCloud container at
+`~/Library/Mobile Documents/iCloud~dev~keenranger~healthdrop/Documents/healthdrop.json`
+as a fallback. On macOS that container is TCC-protected and a sandboxed
+claw usually cannot read it directly — which is why the mirror exists.
+
+**Prerequisite:** the macOS helper must be installed so `~/.healthdrop/`
+stays fresh. See the [README](README.md#prerequisites--install-the-macos-helper-first)
+for the one-time `brew install` + `healthdrop install` setup.
+
+If `~/.healthdrop/healthdrop.json` does not exist, the helper has not run
+yet (install it). If it exists but is stale, iCloud may not have synced —
+open the HealthDrop app on iPhone to trigger a fresh export.
 
 ## When to invoke
 
@@ -85,8 +107,9 @@ identifiers without the `HKQuantityTypeIdentifier` prefix (e.g.
 python3 skills/healthdrop/examine.py
 ```
 
-Reads the canonical iCloud path, computes four domains (sleep,
-cardiovascular & recovery, activity & energy, body composition & gait),
+Reads the default export path (the helper mirror; see Data location),
+computes four domains (sleep, cardiovascular & recovery, activity &
+energy, body composition & gait),
 applies consumer-grade thresholds, and prints a compact digest. Read the
 **digest**, not the JSON — re-reading the file defeats the purpose.
 
@@ -99,7 +122,7 @@ Check the status header first:
 
 Flags:
 
-- `--input PATH` overrides the iCloud path.
+- `--input PATH` overrides the default path.
 - `--json` emits `DigestReport` (`schema: "healthdrop.digest/1"`) with
   numbers, band tokens (`green`/`amber`/`red`), and bilingual flag messages
   (`message_ko`/`message_en`).

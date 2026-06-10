@@ -46,12 +46,40 @@ import sys
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Optional
 
-# Canonical iCloud Drive path the HealthDrop app overwrites on every export.
-DEFAULT_INPUT = (
+# HealthDrop export locations, in the precedence resolve_default_input() uses.
+# Mirror-first: the macOS helper re-exports the TCC-protected iCloud container
+# to this plain path under the home dir, so a claw launched by Claude Desktop /
+# Cursor / OpenClaw can read it without a Full Disk Access grant. The iCloud
+# container stays as a legacy fallback for setups without the helper installed.
+HELPER_MIRROR_INPUT = "~/.healthdrop/healthdrop.json"
+ICLOUD_INPUT = (
     "~/Library/Mobile Documents/iCloud~dev~keenranger~healthdrop/Documents/healthdrop.json"
 )
 
-EXPECTED_SCHEMA_VERSION = 2
+
+def resolve_default_input() -> str:
+    """Resolve the default healthdrop.json path, mirror-first.
+
+    Precedence:
+      1. $HEALTHDROP_EXPORT_PATH if set -- explicit override, always wins.
+         Returned even when it does not exist, so a typo surfaces through the
+         normal not-found gate instead of silently falling back.
+      2. ~/.healthdrop/healthdrop.json -- the macOS helper mirror (TCC-free).
+         PRIMARY: the only path a sandboxed consumer claw can reliably read.
+      3. the iCloud container path -- legacy fallback when the helper is not
+         installed.
+
+    Returns a '~'-prefixed path; callers expand it via os.path.expanduser.
+    """
+    override = os.environ.get("HEALTHDROP_EXPORT_PATH")
+    if override:
+        return override
+    if os.path.exists(os.path.expanduser(HELPER_MIRROR_INPUT)):
+        return HELPER_MIRROR_INPUT
+    return ICLOUD_INPUT
+
+
+EXPECTED_SCHEMA_VERSION = 4
 
 # Full expected metric catalog (key -> expected unit), mirroring QUANTITY_METRICS
 # in src/health/metrics.ts. Used for the coverage/empty audit only.
@@ -1294,8 +1322,8 @@ _FLAG_MESSAGES: dict[str, tuple[str, str]] = {
         "File present but not valid JSON.",
     ),
     "schema_mismatch": (
-        "schemaVersion가 2가 아니에요 — 최선으로 파싱했지만 결과가 불완전할 수 있어요.",
-        "schemaVersion is not 2 — parsed best-effort, results may be incomplete.",
+        f"schemaVersion가 {EXPECTED_SCHEMA_VERSION}가 아니에요 — 최선으로 파싱했지만 결과가 불완전할 수 있어요.",
+        f"schemaVersion is not {EXPECTED_SCHEMA_VERSION} — parsed best-effort, results may be incomplete.",
     ),
     "stale_data": (
         "데이터가 24~72시간 전 기준이에요 — 신선도 주의.",
@@ -1492,7 +1520,7 @@ def render_text(report: dict) -> str:
     if m["range_start_local"] and m["range_end_local"]:
         L.append(f"Window: {m['range_start_local']} .. {m['range_end_local']}")
     if not m["schema_ok"]:
-        L.append(f"(schemaVersion={m['schema_version']}, expected 2 — best-effort parse)")
+        L.append(f"(schemaVersion={m['schema_version']}, expected {EXPECTED_SCHEMA_VERSION} — best-effort parse)")
 
     # Overall
     o = report["overall"]
@@ -2290,7 +2318,7 @@ def cmd_query(argv: list[str]) -> int:
     sub = p.add_subparsers(dest="qcmd", required=True)
 
     def _common(sp: argparse.ArgumentParser) -> None:
-        sp.add_argument("input", nargs="?", default=DEFAULT_INPUT, help="Path to healthdrop.json.")
+        sp.add_argument("input", nargs="?", default=None, help="Path to healthdrop.json.")
         sp.add_argument("--input", dest="input_opt", default=None, help="Alternative way to pass the path.")
         sp.add_argument("--json", action="store_true", help="Machine-readable output.")
 
@@ -2314,7 +2342,11 @@ def cmd_query(argv: list[str]) -> int:
     _common(pd)
 
     args = p.parse_args(argv)
-    db_path, code = ensure_query_index(os.path.expanduser(args.input_opt or args.input), args.json)
+    # Default resolved here, not at import: keeps $HEALTHDROP_EXPORT_PATH and
+    # the mirror-existence check evaluated at invocation time.
+    db_path, code = ensure_query_index(
+        os.path.expanduser(args.input_opt or args.input or resolve_default_input()), args.json
+    )
     if db_path is None:
         return code
     con = sqlite3.connect(db_path)
@@ -2342,15 +2374,16 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument(
         "input",
         nargs="?",
-        default=DEFAULT_INPUT,
-        help="Path to healthdrop.json (default: canonical iCloud path).",
+        default=None,
+        help="Path to healthdrop.json (default: $HEALTHDROP_EXPORT_PATH, else the "
+        "~/.healthdrop/ helper mirror, else the iCloud container).",
     )
     parser.add_argument("--input", dest="input_opt", default=None, help="Alternative way to pass the input path.")
     parser.add_argument("--json", action="store_true", help="Emit the machine-readable DigestReport JSON.")
     parser.add_argument("--lang", choices=["ko", "en"], default=None, help="Render-language hint (JSON carries both).")
     args = parser.parse_args(raw_argv)
 
-    path = os.path.expanduser(args.input_opt or args.input)
+    path = os.path.expanduser(args.input_opt or args.input or resolve_default_input())
     data, code = load_export_or_report(path, args.json)
     if data is None:
         return code
